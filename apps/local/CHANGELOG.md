@@ -1,5 +1,32 @@
 # @executor-js/local
 
+## 1.6.4
+
+### Patch Changes
+
+- Updated dependencies [[`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`9dcfaa5`](https://github.com/UsefulSoftwareCo/executor/commit/9dcfaa5ee8ad2ebc17407caf94d8d4dcf55e3562), [`939b96f`](https://github.com/UsefulSoftwareCo/executor/commit/939b96f694a420cd6151c4e402cff7f1ab4b327a), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84)]:
+  - @executor-js/sdk@1.6.4
+  - @executor-js/react@1.4.67
+  - @executor-js/plugin-file-secrets@1.6.4
+  - @executor-js/plugin-keychain@1.6.4
+  - @executor-js/plugin-mcp@1.6.4
+  - @executor-js/app@1.4.4
+  - @executor-js/analytics@0.1.11
+  - @executor-js/api@1.4.67
+  - @executor-js/config@1.6.4
+  - @executor-js/execution@1.6.4
+  - @executor-js/vite-plugin@0.0.64
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/mcp-apps-shell@1.4.15
+  - @executor-js/plugin-desktop-settings@1.6.4
+  - @executor-js/plugin-example@1.6.4
+  - @executor-js/plugin-graphql@1.6.4
+  - @executor-js/plugin-onepassword@1.6.4
+  - @executor-js/plugin-openapi@1.6.4
+  - @executor-js/plugin-provider-service-split@0.0.18
+  - @executor-js/plugin-toolkits@1.5.39
+  - @executor-js/runtime-quickjs@1.6.4
+
 ## 1.6.3
 
 ### Patch Changes
