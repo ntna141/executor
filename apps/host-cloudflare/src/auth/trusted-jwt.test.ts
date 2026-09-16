@@ -17,7 +17,7 @@ const config: CloudflareConfig = {
   sparkToExecutorJwtSecret: secret,
   trustedJwtIssuer: "spark",
   trustedJwtAudience: "spark-executor",
-  trustedJwtOrganizationClaim: "org",
+  firstPartyOAuthClients: [],
   sparkToolsOrigin: "",
   executorToSparkJwtSecret: "",
   adminEmails: [],
@@ -31,7 +31,7 @@ const config: CloudflareConfig = {
 };
 
 const token = (overrides: Readonly<Record<string, unknown>> = {}) =>
-  new SignJWT({ org: "org-1", ...overrides })
+  new SignJWT({ org: "user-1", ...overrides })
     .setProtectedHeader({ alg: "HS256" })
     .setSubject("user-1")
     .setIssuer("spark")
@@ -53,10 +53,9 @@ describe("makeTrustedJwtVerifier", () => {
 
       expect(principal).toMatchObject({
         accountId: "user-1",
-        organizationId: "org-1",
-        roles: ["member"],
-        orgRoleModel: "organization",
-        orgRole: "member",
+        organizationId: "user-1",
+        roles: ["admin"],
+        orgRoleModel: "none",
       });
     }),
   );
@@ -64,7 +63,7 @@ describe("makeTrustedJwtVerifier", () => {
   it.effect("rejects a token for another audience", () =>
     Effect.gen(function* () {
       const wrongAudience = yield* Effect.promise(() =>
-        new SignJWT({ org: "org-1" })
+        new SignJWT({ org: "user-1" })
           .setProtectedHeader({ alg: "HS256" })
           .setSubject("user-1")
           .setIssuer("spark")
@@ -79,28 +78,24 @@ describe("makeTrustedJwtVerifier", () => {
     }),
   );
 
-  it.effect("uses the configured organization when the token has no organization claim", () =>
+  it.effect("binds the tenant to the subject when the token has no organization claim", () =>
     Effect.gen(function* () {
       const signedToken = yield* Effect.promise(() => token({ org: undefined }));
       const principal = yield* makeTrustedJwtVerifier(config).verify(requestWith(signedToken));
 
       expect(principal).toMatchObject({
         accountId: "user-1",
-        organizationId: "spark",
+        organizationId: "user-1",
       });
     }),
   );
 
-  it.effect("promotes a signed admin role claim to workspace admin", () =>
+  it.effect("rejects a token whose organization claim names another tenant", () =>
     Effect.gen(function* () {
-      const signedToken = yield* Effect.promise(() => token({ role: "admin" }));
+      const signedToken = yield* Effect.promise(() => token({ org: "spark" }));
       const principal = yield* makeTrustedJwtVerifier(config).verify(requestWith(signedToken));
 
-      expect(principal).toMatchObject({
-        roles: ["admin"],
-        orgRoleModel: "organization",
-        orgRole: "admin",
-      });
+      expect(principal).toBeNull();
     }),
   );
 });

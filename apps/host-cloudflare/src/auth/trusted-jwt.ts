@@ -10,31 +10,37 @@ const BEARER_PREFIX = "Bearer ";
 const optionalString = (value: unknown): string | null =>
   typeof value === "string" && value.length > 0 ? value : null;
 
+/**
+ * Every Spark user is their own Executor tenant: the token's subject is both
+ * the acting account and the organization id, so a user's catalog, added MCP
+ * servers, OAuth clients, and connections are partitioned from every other
+ * user's. There is no workspace to administer, so the role model is `none`
+ * and the user may write anything inside their own tenant.
+ *
+ * Spark also signs `org` as the user id. It carries no extra information, but
+ * a token whose `org` names anything else is a signer bug that would silently
+ * land the user in a shared tenant, so it is refused rather than reconciled.
+ */
 export const principalFromTrustedJwtClaims = (
   claims: JWTPayload,
   config: CloudflareConfig,
 ): Principal | null => {
   const accountId = optionalString(claims.sub);
-  const organizationId =
-    optionalString(claims[config.trustedJwtOrganizationClaim]) ?? config.organizationId;
   if (!accountId || typeof claims.exp !== "number") return null;
-  // Spark signs `role: "admin"` only for operator tooling (catalog and OAuth
-  // client administration). Every user-facing token is a plain member, which
-  // the organization role model keeps away from org-owned rows.
-  const isAdmin = claims.role === "admin";
+  const org = optionalString(claims.org);
+  if (org !== null && org !== accountId) return null;
 
   return {
     kind: "member",
     accountId,
-    organizationId,
-    organizationName: optionalString(claims.org_name) ?? organizationId,
-    organizationSlug: optionalString(claims.org_slug) ?? config.organizationSlug,
+    organizationId: accountId,
+    organizationName: optionalString(claims.name) ?? accountId,
+    organizationSlug: config.organizationSlug,
     email: optionalString(claims.email) ?? "",
     name: optionalString(claims.name),
     avatarUrl: null,
-    roles: isAdmin ? ["admin"] : ["member"],
-    orgRoleModel: "organization",
-    orgRole: isAdmin ? "admin" : "member",
+    roles: ["admin"],
+    orgRoleModel: "none",
   };
 };
 

@@ -1,7 +1,10 @@
 import type { D1Database, DurableObjectNamespace, R2Bucket } from "@cloudflare/workers-types";
 
 import { isValidOrgSlug } from "@executor-js/api";
+import type { FirstPartyOAuthClientConfig } from "@executor-js/sdk";
 import { missingPublicOriginWarning, resolvePublicOrigin } from "@executor-js/sdk/public-origin";
+
+import { firstPartyOAuthClientsFromEnv } from "./first-party-oauth-clients";
 
 let warnedNoCloudflareOrigin = false;
 
@@ -10,7 +13,9 @@ let warnedNoCloudflareOrigin = false;
 // receives its bindings + vars per request as `env`, so config is derived from
 // that object — there is no process.env, no filesystem, no boot-time secret
 // generation. Identity is supplied by Cloudflare Access or a trusted JWT
-// selected by AUTH_MODE.
+// selected by AUTH_MODE. In trusted-JWT mode every Spark user is their own
+// tenant (auth/trusted-jwt.ts); SELF_HOSTED_ORG_* only names the Access-mode
+// workspace and the URL slug.
 // ---------------------------------------------------------------------------
 
 export const CLOUDFLARE_NAMESPACE = "executor_cloudflare";
@@ -48,8 +53,11 @@ export interface CloudflareEnv {
   readonly SPARK_TO_EXECUTOR_JWT_SECRET?: string;
   readonly TRUSTED_JWT_ISSUER?: string;
   readonly TRUSTED_JWT_AUDIENCE?: string;
-  /** Claim that carries the Executor tenant id. Defaults to `org`. */
-  readonly TRUSTED_JWT_ORGANIZATION_CLAIM?: string;
+  /** Host-operated Slack app (Web API user-token flow) every user tenant may
+   *  connect through. Both are Wrangler secrets; the app is absent unless both
+   *  are set. */
+  readonly FIRST_PARTY_SLACK_CLIENT_ID?: string;
+  readonly FIRST_PARTY_SLACK_CLIENT_SECRET?: string;
   /** Public origin described by Spark's OpenAPI document. */
   readonly SPARK_TOOLS_ORIGIN?: string;
   /** Signs short-lived Executor-to-Spark tool requests. */
@@ -83,7 +91,7 @@ export interface CloudflareConfig {
   readonly sparkToExecutorJwtSecret: string;
   readonly trustedJwtIssuer: string;
   readonly trustedJwtAudience: string;
-  readonly trustedJwtOrganizationClaim: string;
+  readonly firstPartyOAuthClients: readonly FirstPartyOAuthClientConfig[];
   readonly sparkToolsOrigin: string;
   readonly executorToSparkJwtSecret: string;
   readonly adminEmails: readonly string[];
@@ -211,7 +219,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     sparkToExecutorJwtSecret: env.SPARK_TO_EXECUTOR_JWT_SECRET?.trim() ?? "",
     trustedJwtIssuer: env.TRUSTED_JWT_ISSUER?.trim() ?? "",
     trustedJwtAudience: env.TRUSTED_JWT_AUDIENCE?.trim() ?? "",
-    trustedJwtOrganizationClaim: env.TRUSTED_JWT_ORGANIZATION_CLAIM?.trim() || "org",
+    firstPartyOAuthClients: firstPartyOAuthClientsFromEnv(env),
     sparkToolsOrigin: env.SPARK_TOOLS_ORIGIN?.trim().replace(/\/+$/, "") ?? "",
     executorToSparkJwtSecret: env.EXECUTOR_TO_SPARK_JWT_SECRET?.trim() ?? "",
     adminEmails: splitLower(env.ADMIN_EMAILS),

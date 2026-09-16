@@ -23,7 +23,7 @@ const config: CloudflareConfig = {
   sparkToExecutorJwtSecret: secret,
   trustedJwtIssuer: "spark",
   trustedJwtAudience: "spark-executor",
-  trustedJwtOrganizationClaim: "org",
+  firstPartyOAuthClients: [],
   sparkToolsOrigin: "",
   executorToSparkJwtSecret: "",
   adminEmails: [],
@@ -68,7 +68,8 @@ describe("makeSparkMcpCapabilityVerifier", () => {
 
       expect(principal).toMatchObject({
         accountId: "user-1",
-        organizationId: "spark",
+        organizationId: "user-1",
+        orgRoleModel: "none",
       });
     }),
   );

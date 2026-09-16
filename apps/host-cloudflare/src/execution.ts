@@ -76,6 +76,7 @@ export const makeCloudflareHostConfig = (config: CloudflareConfig): Layer.Layer<
     allowLocalNetwork: config.allowLocalNetwork,
     webBaseUrl: config.webBaseUrl,
     oauthCallbackPath: "/api/oauth/callback",
+    firstPartyOAuthClients: config.firstPartyOAuthClients,
   });
 
 /**

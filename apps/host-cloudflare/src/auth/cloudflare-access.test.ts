@@ -14,7 +14,7 @@ const config: CloudflareConfig = {
   sparkToExecutorJwtSecret: "",
   trustedJwtIssuer: "",
   trustedJwtAudience: "",
-  trustedJwtOrganizationClaim: "org",
+  firstPartyOAuthClients: [],
   sparkToolsOrigin: "",
   executorToSparkJwtSecret: "",
   adminEmails: ["admin@example.com"],

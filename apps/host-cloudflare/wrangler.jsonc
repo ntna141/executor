@@ -66,16 +66,16 @@
     { "tag": "v1", "new_sqlite_classes": ["McpSessionDO"] },
     { "tag": "v2", "new_sqlite_classes": ["McpExecutionOwnerDirectoryDO"] },
   ],
-  // WorkAgent uses short-lived JWTs for HTTP APIs and a persistent,
-  // conversation-bound capability for the public MCP endpoint.
-  // SPARK_TO_EXECUTOR_JWT_SECRET, EXECUTOR_TO_SPARK_JWT_SECRET, and EXECUTOR_SECRET_KEY are
-  // Wrangler secrets; never put them in this file. Access mode remains
-  // available to upstream users.
+  // Spark signs short-lived JWTs for HTTP APIs and a persistent,
+  // conversation-bound capability for the public MCP endpoint. Both bind the
+  // user id as the tenant, so every user has a private catalog.
+  // SPARK_TO_EXECUTOR_JWT_SECRET, EXECUTOR_TO_SPARK_JWT_SECRET, EXECUTOR_SECRET_KEY,
+  // and FIRST_PARTY_SLACK_CLIENT_ID/SECRET are Wrangler secrets; never put them
+  // in this file. Access mode remains available to upstream users.
   "vars": {
     "AUTH_MODE": "trusted-jwt",
     "TRUSTED_JWT_ISSUER": "spark",
     "TRUSTED_JWT_AUDIENCE": "spark-executor",
-    "TRUSTED_JWT_ORGANIZATION_CLAIM": "org",
     "SPARK_TOOLS_ORIGIN": "https://cloudflare-chat-agent.ntna102.workers.dev",
     "ACCESS_NAME_CLAIM": "name",
     "ACCESS_GROUPS_CLAIM": "groups",

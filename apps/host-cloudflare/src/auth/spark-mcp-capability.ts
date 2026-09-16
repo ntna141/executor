@@ -16,20 +16,19 @@ const MINIMUM_SECRET_LENGTH = 32;
 export const sparkMcpCapabilitySignatureInput = (userId: string, conversationId: string): string =>
   `spark-executor-mcp\n${SPARK_MCP_AUTH_VERSION}\n${userId}\n${conversationId}`;
 
+// The capability acts for one user inside that user's own tenant (see
+// trusted-jwt.ts): the user id is both the account and the organization.
 const sparkPrincipal = (userId: string, config: CloudflareConfig): Principal => ({
   kind: "member",
   accountId: userId,
-  organizationId: config.organizationId,
-  organizationName: config.organizationName,
+  organizationId: userId,
+  organizationName: userId,
   organizationSlug: config.organizationSlug,
   email: "",
   name: null,
   avatarUrl: null,
-  roles: ["member"],
-  // A conversation capability acts for one user and never administers the
-  // workspace catalog.
-  orgRoleModel: "organization",
-  orgRole: "member",
+  roles: ["admin"],
+  orgRoleModel: "none",
 });
 
 export const makeSparkMcpCapabilityVerifier = (config: CloudflareConfig) => {

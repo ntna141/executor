@@ -80,7 +80,7 @@ describe("loadConfig", () => {
       authMode: "trusted-jwt",
       trustedJwtIssuer: "https://issuer.example.com",
       trustedJwtAudience: "executor",
-      trustedJwtOrganizationClaim: "org",
+      firstPartyOAuthClients: [],
     });
   });
 
