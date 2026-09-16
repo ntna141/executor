@@ -25,10 +25,10 @@ import {
   type KeepPathItem,
 } from "./split";
 import { HttpMethod, ServerInfo, type ExtractedOperation, type ExtractionResult } from "./types";
+import { getHealthCheckParameters } from "./health-check-operation";
 
-// Mutating HTTP methods: mirrors `REQUIRE_APPROVAL` in `./invoke` but kept
-// inline so this browser-safe preview module never pulls in the HTTP execution
-// path. A health check should be safe to re-run, so these rank last.
+// Keep potentially mutating methods ranked below ordinary reads. This mirrors
+// REQUIRE_APPROVAL without importing the HTTP execution path into the browser.
 const DESTRUCTIVE_METHODS = new Set(["post", "put", "patch", "delete"]);
 
 // Cap on health-check candidate METADATA carried in the preview, so the add
@@ -122,6 +122,9 @@ export const HeaderPreset = Schema.Struct({
   headers: Schema.Record(Schema.String, Schema.NullOr(Schema.String)),
   /** Which headers should be stored as secrets */
   secretHeaders: Schema.Array(Schema.String),
+  /** Query parameters the strategy sends the secret in (apiKey in=query,
+   *  e.g. Viator's legacy `?apiKey=`). Absent on older stored previews. */
+  secretQueryParams: Schema.optional(Schema.Array(Schema.String)),
 });
 export type HeaderPreset = typeof HeaderPreset.Type;
 
@@ -347,6 +350,7 @@ const buildHeaderPresets = (
 
     const headers: Record<string, string | null> = {};
     const secretHeaders: string[] = [];
+    const secretQueryParams: string[] = [];
     const labelParts: string[] = [];
 
     for (const scheme of resolved) {
@@ -363,8 +367,16 @@ const buildHeaderPresets = (
         headers[headerName] = null;
         secretHeaders.push(headerName);
         labelParts.push(scheme.name);
+      } else if (scheme.type === "apiKey" && Option.getOrElse(scheme.in, () => "") === "query") {
+        secretQueryParams.push(Option.getOrElse(scheme.headerName, () => scheme.name));
+        labelParts.push(`${scheme.name} (query)`);
       } else if (scheme.type === "apiKey") {
-        labelParts.push(`${scheme.name} (${Option.getOrElse(scheme.in, () => "unknown")})`);
+        // Cookie (and unknown) locations are not renderable as a stored
+        // method — auth placements carry header|query — and a cookie scheme
+        // is usually the vendor console's own session, not a mintable
+        // credential. Contributing a label here used to produce a method
+        // with zero placements: an empty, unfillable card in the add flow.
+        continue;
       } else if (scheme.type === "oauth2" || scheme.type === "openIdConnect") {
         return [];
       } else {
@@ -372,21 +384,16 @@ const buildHeaderPresets = (
       }
     }
 
-    if (Object.keys(headers).length === 0 && resolved.length > 0) {
-      return [
-        HeaderPreset.make({
-          label: labelParts.join(" + "),
-          headers: {},
-          secretHeaders: [],
-        }),
-      ];
-    }
+    // A strategy in which nothing is renderable (cookie-only, or an exotic
+    // scheme type) yields no preset rather than an empty one.
+    if (secretHeaders.length === 0 && secretQueryParams.length === 0) return [];
 
     return [
       HeaderPreset.make({
         label: labelParts.join(" + "),
         headers,
         secretHeaders,
+        ...(secretQueryParams.length > 0 ? { secretQueryParams } : {}),
       }),
     ];
   });
@@ -480,18 +487,11 @@ const buildPreviewHealthCheckCandidates = (
     .map((def): HealthCheckCandidate => {
       const op = def.operation;
       const method = op.method.toLowerCase();
-      const parameters = op.parameters.map((parameter) => ({
-        name: parameter.name,
-        location: parameter.location,
-        required: parameter.required,
-        ...(Option.isSome(parameter.description)
-          ? { description: parameter.description.value }
-          : {}),
-      }));
+      const parameters = getHealthCheckParameters(op);
       return {
         operation: def.toolPath,
         method,
-        requiredArgCount: op.parameters.filter((parameter) => parameter.required).length,
+        requiredArgCount: parameters.filter((parameter) => parameter.required).length,
         destructive: DESTRUCTIVE_METHODS.has(method),
         summary:
           Option.getOrUndefined(op.summary) ??
@@ -583,13 +583,19 @@ export const previewSpecText = Effect.fn("OpenApi.previewSpecText")(function* (s
 
 const streamedCandidate = (op: StreamedPreviewOperation): HealthCheckCandidate => {
   const method = op.method.toLowerCase();
+  const parameters = [
+    ...op.parameters,
+    ...(op.requestBodyRequired === undefined
+      ? []
+      : [{ name: "body", location: "body", required: op.requestBodyRequired }]),
+  ];
   return {
     operation: op.toolPath,
     method,
-    requiredArgCount: op.parameters.filter((parameter) => parameter.required).length,
+    requiredArgCount: parameters.filter((parameter) => parameter.required).length,
     destructive: DESTRUCTIVE_METHODS.has(method),
     summary: op.summary ?? op.description ?? `${method.toUpperCase()} ${op.pathTemplate}`,
-    ...(op.parameters.length > 0 ? { parameters: op.parameters } : {}),
+    ...(parameters.length > 0 ? { parameters } : {}),
   };
 };
 

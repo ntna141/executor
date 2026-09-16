@@ -13,6 +13,8 @@ import {
   ToolName,
 } from "./ids";
 import { ElicitationResponse, type ElicitationHandler } from "./elicitation";
+import { createExecutor } from "./executor";
+import type { FumaDb } from "./fuma-runtime";
 import {
   effectivePolicyFromSorted,
   isValidPattern,
@@ -21,7 +23,7 @@ import {
 } from "./policies";
 import { definePlugin, tool } from "./plugin";
 import type { CredentialProvider } from "./provider";
-import { makeTestExecutor } from "./testing";
+import { makeTestConfig, makeTestExecutor } from "./testing";
 
 // ---------------------------------------------------------------------------
 // Pure unit tests — pattern matcher + resolution. No executor required.
@@ -358,6 +360,35 @@ const setupExecutor = () =>
     ),
   );
 
+/** Model a concurrent remover that wins immediately after policy update. */
+const removePolicyAfterUpdate = (db: FumaDb, armed: () => boolean): FumaDb => {
+  const wrap = (inner: FumaDb): FumaDb =>
+    new Proxy(inner, {
+      get(target, property) {
+        if (property === "withContext") {
+          return (context: unknown) =>
+            wrap((target.withContext as (value: unknown) => FumaDb)(context));
+        }
+        if (property === "transaction") {
+          return (run: (transactionDb: FumaDb) => Promise<unknown>) =>
+            target.transaction((transactionDb) => run(wrap(transactionDb as FumaDb)));
+        }
+        if (property === "updateMany") {
+          return async (...args: Parameters<FumaDb["updateMany"]>) => {
+            const [table, input] = args;
+            const result = await target.updateMany(...args);
+            if (armed() && table === "tool_policy") {
+              await target.deleteMany(table, { where: input.where });
+            }
+            return result;
+          };
+        }
+        return Reflect.get(target, property);
+      },
+    });
+  return wrap(db);
+};
+
 describe("executor.policies", () => {
   it.effect("list is empty when no rules exist", () =>
     Effect.gen(function* () {
@@ -428,6 +459,23 @@ describe("executor.policies", () => {
     }),
   );
 
+  it.live("concurrent creates of equally specific rules get distinct positions", () =>
+    Effect.gen(function* () {
+      const executor = yield* setupExecutor();
+      yield* Effect.all(
+        [
+          executor.policies.create({ owner: "org", pattern: "vercel.dns.create", action: "block" }),
+          executor.policies.create({ owner: "org", pattern: "vercel.dns.delete", action: "block" }),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      const rules = yield* executor.policies.list();
+      expect(rules).toHaveLength(2);
+      expect(new Set(rules.map((r) => r.position)).size).toBe(2);
+    }),
+  );
+
   it.effect("create stores rules at the requested owner", () =>
     Effect.gen(function* () {
       const executor = yield* setupExecutor();
@@ -480,6 +528,40 @@ describe("executor.policies", () => {
       const rules = yield* executor.policies.list();
       expect(rules[0]?.action).toBe("block");
     }),
+  );
+
+  it.effect("fails when the policy vanishes during update", () =>
+    Effect.gen(function* () {
+      let armed = false;
+      const config = makeTestConfig({ plugins: [policyTestPlugin()] as const });
+      const executor = yield* createExecutor({
+        ...config,
+        db: removePolicyAfterUpdate(config.db, () => armed),
+      });
+      yield* Effect.addFinalizer(() =>
+        executor
+          .close()
+          .pipe(Effect.andThen(Effect.promise(() => config.testDb.close())), Effect.ignore),
+      );
+      const created = yield* executor.policies.create({
+        owner: "org",
+        pattern: "vercel.*",
+        action: "require_approval",
+      });
+      armed = true;
+
+      const result = yield* executor.policies
+        .update({ id: String(created.id), owner: "org", action: "block" })
+        .pipe(Effect.result);
+      expect(Result.isFailure(result)).toBe(true);
+      expect(
+        Result.match(result, {
+          onFailure: (failure) => String(failure),
+          onSuccess: () => "",
+        }),
+      ).toContain(`Tool policy disappeared while it was being updated: ${created.id}`);
+      expect(yield* executor.policies.list()).toEqual([created]);
+    }).pipe(Effect.scoped),
   );
 
   it.effect("remove deletes the rule", () =>

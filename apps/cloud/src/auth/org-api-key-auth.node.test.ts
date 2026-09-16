@@ -13,6 +13,19 @@ import { isPlatformAuth, resolveApiKeyPrincipal, resolveBearerAuth } from "./wor
 
 const createdAt = new Date("2026-01-01T00:00:00.000Z");
 
+// The mirror's account row as `ensureAccount` mints it: id only, profile
+// columns unfilled until a WorkOS user payload arrives.
+const bareAccount = (id: string) => ({
+  id,
+  email: null,
+  firstName: null,
+  lastName: null,
+  avatarUrl: null,
+  workosUpdatedAt: null,
+  lastSignInAt: null,
+  createdAt,
+});
+
 const stubApiKeys = Layer.succeed(ApiKeyService)({
   validate: (value: string) => {
     if (value === "valid_org_key") {
@@ -65,23 +78,32 @@ const stubUsers = Layer.succeed(UserStoreService)({
   use: (_op, fn) =>
     Effect.promise(() =>
       fn({
-        ensureAccount: async (id: string) => ({ id, createdAt }),
-        getAccount: async (id: string) => ({ id, createdAt }),
+        ensureAccount: async (id: string) => bareAccount(id),
+        getAccount: async (id: string) => bareAccount(id),
         upsertOrganization: async (org: { id: string; name: string }) => ({
           ...org,
           slug: `org-slug-${org.id}`,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         getOrganization: async (id: string) => ({
           id,
           name: `Org ${id}`,
           slug: `org-slug-${id}`,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         getOrganizationBySlug: async (slug: string) => ({
           id: "org_by_slug",
           name: `Org ${slug}`,
           slug,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         deleteOrganizationCascade: async () => {},
@@ -120,7 +142,10 @@ describe("org-level API keys", () => {
       const auth = yield* resolveBearerAuth(bearer("valid_user_key")).pipe(Effect.provide(layers));
 
       expect(isPlatformAuth(auth)).toBe(false);
-      expect(auth).toMatchObject({ accountId: "user_123", organizationId: "org_123" });
+      expect(auth).toMatchObject({
+        accountId: "user_123",
+        organizationId: "org_123",
+      });
     }),
   );
 

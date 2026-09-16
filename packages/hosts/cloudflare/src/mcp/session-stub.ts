@@ -1,8 +1,10 @@
 import type { ResumeResponse } from "@executor-js/execution";
+import type { McpResource } from "@executor-js/host-mcp";
 
 import type {
   IncomingTraceHeaders,
   McpApprovalOwner,
+  McpApprovalPrincipal,
   McpSessionApprovalResult,
   McpSessionModelResumeResult,
   McpSessionResumeApprovalResult,
@@ -17,6 +19,7 @@ export interface McpSessionNamespace<Id> {
 export interface McpSessionStub {
   readonly validateMcpSessionOwner: (
     identity: McpApprovalOwner,
+    resource: McpResource,
   ) => Promise<"ok" | "not_found" | "forbidden" | "terminated">;
   readonly _cf_scheduleDestroy: () => Promise<void>;
   readonly getPausedExecutionForApproval: (
@@ -26,7 +29,7 @@ export interface McpSessionStub {
   ) => Promise<McpSessionApprovalResult>;
   readonly resumeExecutionForApproval: (
     executionId: string,
-    identity: McpApprovalOwner,
+    identity: McpApprovalPrincipal,
     response: ResumeResponse,
     incoming?: IncomingTraceHeaders,
   ) => Promise<McpSessionResumeApprovalResult>;

@@ -1,3 +1,4 @@
+import { reattachDefs } from "@executor-js/sdk/host-internal";
 import { Data, Duration, Effect, Match, Option, Predicate, Result, Schema } from "effect";
 import * as Cause from "effect/Cause";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -20,21 +21,38 @@ import type {
 import { Validator } from "@cfworker/json-schema";
 import * as z from "zod/v4";
 
-import { isToolFile, sanitizeArtifactPreviewMarkup } from "@executor-js/sdk";
+import {
+  CurrentOrgWriteAccess,
+  ToolAddress,
+  IntegrationSlug,
+  ConnectionName,
+  parseToolAddress,
+  isToolFile,
+  isToolResult,
+  makeOrgWriteAccessState,
+  sanitizeArtifactPreviewMarkup,
+  type OrgWriteAccess,
+} from "@executor-js/sdk";
 import type {
   Artifact,
+  Connection,
+  Integration,
   ArtifactBinding,
   ArtifactSummary,
   ElicitationResponse,
+  ElicitationResponseMeta,
   ElicitationHandler,
   ElicitationContext,
   ElicitationRequest,
   SaveArtifactInput,
   ToolFileValue,
+  Executor,
+  ToolSchemaView,
 } from "@executor-js/sdk";
 import type * as Tracer from "effect/Tracer";
 import {
   createExecutionEngine,
+  searchTools,
   formatExecuteResult,
   formatPausedExecution,
   formatTtlDuration,
@@ -67,6 +85,13 @@ import {
   resolveArtifactBindings,
   type BindableConnection,
 } from "./artifact-bindings";
+import { MCP_ORG_WRITE_ACCESS_HEADER } from "./seams";
+import {
+  passthroughCallCode,
+  passthroughInstructions,
+  SEARCH_INVOKE_SKILL,
+} from "./passthrough-tools";
+import type { McpToolMode } from "./browser-approval";
 
 // ---------------------------------------------------------------------------
 // Workers-compatible JSON Schema validator (replaces Ajv which uses new Function())
@@ -173,9 +198,26 @@ type SharedMcpServerConfig = {
    * the `execute` description lists). The tools exist to carry the namespaces
    * into the model's context as tool names; each call routes through the same
    * execution flow as `tools.search({ namespace })` inside `execute`, so the
-   * results match what code-side search returns.
+   * results match what code-side search returns. Codemode only: passthrough
+   * ignores it (it has its own search tool, and codemode search
+   * results point at an `execute` tool passthrough does not serve).
    */
   readonly searchToolsEnabled?: boolean;
+  /**
+   * The tool surface this connection serves. `codemode` (the default) is the
+   * `execute` tool plus `skills`/`resume` and the artifact surface.
+   * `passthrough` (`?mode=passthrough`) serves search and invoke for the
+   * visible catalog, with no execute, skills, resume, or artifact tools.
+   * Invoke is marked destructive for client approval. Requires `tools`.
+   */
+  readonly mode?: McpToolMode;
+  /**
+   * The scoped executor's tool catalog, for passthrough mode. Structurally
+   * satisfied by `executor.tools`. Hosts that never serve passthrough may
+   * leave it unset; a passthrough session without it fails at build time
+   * rather than silently serving an empty surface.
+   */
+  readonly tools?: McpToolsPort;
   /**
    * Renders an artifact once, server-side, before it is saved — so a component
    * that throws on its first render is refused at create time with the real
@@ -200,14 +242,16 @@ type SharedMcpServerConfig = {
    */
   readonly artifacts?: McpArtifactsPort;
   /**
-   * The caller's saved connections, for binding an artifact's integration roles
-   * at create time. Structurally satisfied by `executor.connections`; hosts pass
+   * The caller's saved connections, for the search/invoke account inventory
+   * and binding artifact integration roles at create time. Structurally satisfied by `executor.connections`; hosts pass
    * the same scoped executor they pass `artifacts`.
    *
    * Absent means `create-artifact` cannot bind, so it refuses code that calls an
    * integration rather than saving an artifact that could never run.
    */
   readonly connections?: McpConnectionsPort;
+  /** Scoped integration metadata for the search/invoke account inventory. */
+  readonly integrations?: McpIntegrationsPort;
   /**
    * Builds the web-app deep link for a saved artifact. Clients that can't
    * render MCP Apps get this URL instead of an inline widget. Absent (stdio has
@@ -257,13 +301,34 @@ export type McpArtifactsPort = {
 };
 
 /**
- * The connection surface binding needs: list what this caller can reach. The
+ * The connection surface binding and discovery need: list what this caller can reach. The
  * scoped executor has already narrowed it, so an inferred binding can never
  * name a connection the caller couldn't call themselves.
  */
 export type McpConnectionsPort = {
-  readonly list: () => Effect.Effect<readonly BindableConnection[], unknown>;
+  readonly list: () => Effect.Effect<
+    readonly (BindableConnection &
+      Pick<Connection, "identityLabel" | "description" | "lastHealth">)[],
+    unknown
+  >;
 };
+
+/** Catalog metadata visible to this caller; no tool schemas or credentials. */
+export type McpIntegrationsPort = {
+  readonly list: () => Effect.Effect<
+    readonly Pick<Integration, "slug" | "name" | "description">[],
+    unknown
+  >;
+};
+
+/** The same list and schema APIs used by codemode discovery. */
+export type McpToolsPort = Pick<Executor["tools"], "list" | "schema">;
+
+/** A passthrough session was requested but the host gave the factory no
+ *  catalog to serve. A configuration defect, not a runtime condition. */
+export class McpPassthroughUnavailableError extends Data.TaggedError(
+  "McpPassthroughUnavailableError",
+)<{ readonly reason: string }> {}
 
 export type ExecutorMcpServerConfig<E extends Cause.YieldableError = Cause.YieldableError> =
   | (ExecutionEngineConfig<E> & SharedMcpServerConfig)
@@ -272,9 +337,15 @@ export type ExecutorMcpServerConfig<E extends Cause.YieldableError = Cause.Yield
   | ({ readonly engine: ExecutionEngine<E>; readonly stateless: true } & SharedMcpServerConfig);
 
 export type BrowserApprovalStore = {
-  readonly takeResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
-  readonly waitForResponse?: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+  readonly takeResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
+  readonly waitForResponse?: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
 };
+
+/** Browser response paired with authorization derived from the deciding user. */
+export interface BrowserApprovalDecision {
+  readonly response: ResumeResponse;
+  readonly orgWriteAccess: OrgWriteAccess;
+}
 
 export const PAUSED_APPROVAL_TIMEOUT_MS = 4 * 60 * 1000;
 const BROWSER_APPROVAL_WAIT_TIMEOUT_MS = PAUSED_APPROVAL_TIMEOUT_MS + 1000;
@@ -367,6 +438,9 @@ const elicitationRequestUrl = (request: ElicitationRequest): string | undefined 
 const pausedInteractionKind = (request: ElicitationRequest): ElicitationRequest["_tag"] =>
   elicitationRequestTag(request);
 
+// The request's terms travel as `_meta`, the way they arrived: a native
+// client that renders "Allow Computer Use to use Finder?" needs to see that
+// accepting can be remembered, and which scopes it may answer with.
 const elicitationRequestToParams: (request: ElicitationRequest) => ElicitInputParams =
   Match.type<ElicitationRequest>().pipe(
     Match.tag("UrlElicitation", (req) => ({
@@ -374,6 +448,7 @@ const elicitationRequestToParams: (request: ElicitationRequest) => ElicitInputPa
       message: req.message,
       url: req.url,
       elicitationId: req.elicitationId,
+      ...(req.meta === undefined ? {} : { _meta: req.meta }),
     })),
     Match.tag("FormElicitation", (req) => ({
       message: req.message,
@@ -384,9 +459,18 @@ const elicitationRequestToParams: (request: ElicitationRequest) => ElicitInputPa
         Object.keys(req.requestedSchema).length === 0
           ? { type: "object" as const, properties: {} }
           : req.requestedSchema,
+      ...(req.meta === undefined ? {} : { _meta: req.meta }),
     })),
     Match.exhaustive,
   );
+
+/** The client's answer to the terms: the `persist` scope it chose, read from
+ *  the result's `_meta` — and nothing else, so an answer states no more than
+ *  `ElicitationResponseMeta` names. */
+const answeredTerms = (meta: unknown): ElicitationResponseMeta | undefined => {
+  const persist = isRecord(meta) ? meta["persist"] : undefined;
+  return typeof persist === "string" ? { persist } : undefined;
+};
 
 const makeMcpElicitationHandler =
   (
@@ -430,6 +514,7 @@ const makeMcpElicitationHandler =
         { relatedRequestId },
       );
 
+      const meta = answeredTerms(response._meta);
       debugLog?.("elicitation.response", {
         requestTag,
         action: response.action,
@@ -437,11 +522,13 @@ const makeMcpElicitationHandler =
           typeof response.content === "object" &&
           response.content !== null &&
           Object.keys(response.content).length > 0,
+        persist: meta?.persist,
       });
 
       return {
         action: response.action as typeof ElicitationResponse.Type.action,
         content: response.content,
+        ...(meta === undefined ? {} : { meta }),
       };
     }).pipe(
       Effect.tapDefect((defect) =>
@@ -622,6 +709,64 @@ const toMcpResult = (result: FormattedExecuteInput): McpToolResult => {
     content: [{ type: "text", text: formatted.text }],
     structuredContent: formatted.structured,
     isError: formatted.isError || undefined,
+  };
+};
+
+/**
+ * A passthrough call's result IS the tool's `ToolResult`. Inside `execute`
+ * the model reads `{ ok, data | error }` and branches; here nothing runs
+ * between the tool and the client, so an expected failure (`ok: false` — a
+ * 4xx wall, a blocked policy, a validation miss) has to be an MCP error
+ * result, and a success unwraps to the tool's `data`. Everything else
+ * (sandbox error, emitted output) keeps the codemode rendering.
+ */
+const toPassthroughResult = (outcome: FormattedExecuteInput): McpToolResult => {
+  const value = outcome.result;
+  if (outcome.error || !isToolResult(value)) return toMcpResult(outcome);
+  if (value.ok) {
+    return toMcpResult({ ...outcome, result: value.data });
+  }
+  const message = `${value.error.code}: ${value.error.message}`;
+  return {
+    content: [{ type: "text", text: `Error: ${message}` }],
+    structuredContent: {
+      status: "error",
+      error: value.error,
+      logs: outcome.logs ?? [],
+    },
+    isError: true,
+  };
+};
+
+/**
+ * A passthrough tool asked the user for something and the connected client
+ * advertises no elicitation capability, so nobody could answer. Say exactly
+ * that, and carry the request — a reconnect/OAuth URL is the usual content —
+ * so the model can relay it and the user can act outside the client.
+ */
+const elicitationUnsupportedResult = (
+  toolName: string,
+  request: ElicitationRequest,
+): McpToolResult => {
+  const url = elicitationRequestUrl(request);
+  const lines = [
+    `Tool ${toolName} needs input from the user, but this MCP client does not support elicitation, so the call could not complete.`,
+    `Request: ${request.message}`,
+    ...(url ? [`Open this URL to continue, then retry the call: ${url}`] : []),
+  ];
+  return {
+    content: [{ type: "text", text: `Error: ${lines.join("\n")}` }],
+    structuredContent: {
+      status: "error",
+      error: {
+        code: "elicitation_unsupported",
+        message: lines[0]!,
+        request: request.message,
+        ...(url ? { url } : {}),
+      },
+      logs: [],
+    },
+    isError: true,
   };
 };
 
@@ -859,7 +1004,13 @@ const extractInventory = (description: string): string => {
 type McpRequestJoinKeys = {
   readonly requestId: string | number;
   readonly sessionId?: string | undefined;
+  readonly requestInfo?: {
+    readonly headers: Readonly<Record<string, string | readonly string[] | undefined>>;
+  };
 };
+
+const requestOrgWriteAccess = (extra: McpRequestJoinKeys): OrgWriteAccess =>
+  extra.requestInfo?.headers[MCP_ORG_WRITE_ACCESS_HEADER] === "allowed" ? "allowed" : "denied";
 
 // `mcp.request.session_id` is emitted unconditionally (empty string when the
 // transport carries none) to match the worker-side `annotateMcpRequest`
@@ -881,6 +1032,8 @@ const startMarker = (name: string, attributes: Record<string, unknown>): Effect.
 // user as an inline widget when the client renders MCP Apps, and as a link into
 // the web app when it doesn't. Both carry `artifactId`, because either way the
 // artifact was saved and can be reopened later.
+// `show-artifact` returns source on both channels; create/edit only confirm
+// saves.
 
 const renderRejectedResult = (reason: string): McpToolResult => ({
   content: [{ type: "text", text: `create-artifact rejected: ${reason}` }],
@@ -963,6 +1116,24 @@ const bindingUnresolvedResult = (input: {
   },
   isError: true,
 });
+
+/** Format the stored source for the text result channel. */
+const artifactSourceText = (code: string): string => `Source:\n\`\`\`tsx\n${code}\n\`\`\``;
+
+/** Add source to both MCP result channels. */
+const withArtifactSource = (result: McpToolResult, code: string): McpToolResult => {
+  const source = artifactSourceText(code);
+  const content = result.content.map((block, index) =>
+    index === 0 && block.type === "text"
+      ? { type: "text" as const, text: `${block.text}\n\n${source}` }
+      : block,
+  );
+  return {
+    ...result,
+    content,
+    structuredContent: { ...result.structuredContent, code },
+  };
+};
 
 const renderedInAppResult = (input: {
   readonly code: string;
@@ -1086,12 +1257,271 @@ const parseJsonContent = (raw: string): Record<string, unknown> | undefined => {
 };
 
 // ---------------------------------------------------------------------------
+// Passthrough surface
+// ---------------------------------------------------------------------------
+
+/** Serialize one existing schema view as a self-contained MCP input schema. */
+const passthroughInputSchema = (view: ToolSchemaView): unknown =>
+  reattachDefs(
+    view.inputSchema ?? { type: "object", properties: {} },
+    new Map(Object.entries(view.schemaDefinitions ?? {})),
+  );
+
+/** Register discovery over the existing APIs, with no catalog work at connection time. */
+const registerPassthroughTools = <E extends Cause.YieldableError>(
+  server: McpServer,
+  tools: McpToolsPort,
+  connections: McpConnectionsPort,
+  integrations: McpIntegrationsPort,
+  run: (
+    address: ToolAddress,
+    args: unknown,
+    extra: McpRequestJoinKeys,
+  ) => Effect.Effect<McpToolResult, E>,
+): Effect.Effect<void> =>
+  Effect.gen(function* () {
+    const context = yield* Effect.context<never>();
+    const validator = new CfWorkerJsonSchemaValidator();
+    const boundary = <A extends McpToolResult, F>(
+      effect: Effect.Effect<A, F>,
+      extra: McpRequestJoinKeys,
+    ) =>
+      Effect.runPromiseWith(context)(
+        effect.pipe(
+          Effect.provideService(
+            CurrentOrgWriteAccess,
+            makeOrgWriteAccessState(requestOrgWriteAccess(extra)),
+          ),
+          Effect.catchCause((cause) => Effect.succeed(toMcpFailureResult(cause))),
+        ),
+      );
+    yield* Effect.sync(() => {
+      server.registerTool(
+        "integrations",
+        {
+          description:
+            "List connected integrations and accounts visible to you. Returns integration descriptions, account labels, exact search filters, and last recorded health (null means unchecked). One item per account; use nextOffset for more. Does not load tool schemas or check credentials.",
+          inputSchema: {
+            integration: z.string().trim().min(1).optional().describe("Exact integration slug."),
+            owner: z.enum(["org", "user"]).optional(),
+            limit: z.number().int().min(1).max(50).default(20),
+            offset: z.number().int().min(0).default(0),
+          },
+          annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        },
+        ({ integration, owner, limit, offset }, extra) =>
+          boundary(
+            Effect.gen(function* () {
+              const [accounts, catalog] = yield* Effect.all([
+                connections.list(),
+                integrations.list(),
+              ]);
+              const metadata = new Map(catalog.map((item) => [String(item.slug), item]));
+              const visible = accounts
+                .flatMap((account) => {
+                  const item = metadata.get(account.integration);
+                  if (
+                    !item ||
+                    (integration !== undefined && account.integration !== integration) ||
+                    (owner !== undefined && account.owner !== owner)
+                  )
+                    return [];
+                  return [
+                    {
+                      integration: account.integration,
+                      integrationName: item.name,
+                      integrationDescription: item.description,
+                      owner: account.owner,
+                      connection: account.name,
+                      identityLabel: account.identityLabel ?? null,
+                      description: account.description ?? null,
+                      lastHealth:
+                        account.lastHealth == null
+                          ? null
+                          : {
+                              status: account.lastHealth.status,
+                              checkedAt: account.lastHealth.checkedAt,
+                            },
+                    },
+                  ];
+                })
+                .sort(
+                  (a, b) =>
+                    a.integration.localeCompare(b.integration) ||
+                    a.owner.localeCompare(b.owner) ||
+                    a.connection.localeCompare(b.connection),
+                );
+              const items = visible.slice(offset, offset + limit);
+              const hasMore = offset + items.length < visible.length;
+              const result = {
+                items,
+                total: visible.length,
+                hasMore,
+                nextOffset: hasMore ? offset + items.length : null,
+              };
+              return {
+                content: [{ type: "text" as const, text: JSON.stringify(result) }],
+                structuredContent: result,
+              };
+            }),
+            extra,
+          ),
+      );
+      server.registerTool(
+        "search",
+        {
+          description:
+            "Search connected integration tools by action, integration, or account. Returns matching tool IDs, account details, and full JSON input schemas. Pass the returned ID and arguments to invoke. Use integrations to discover accounts, then pass exact integration, owner, and connection filters. Use nextOffset to page through matches.",
+          inputSchema: {
+            query: z
+              .string()
+              .trim()
+              .min(1)
+              .max(500)
+              .describe("Keywords describing the tool or task, such as github create issue."),
+            integration: z
+              .string()
+              .trim()
+              .min(1)
+              .optional()
+              .describe("Exact integration slug from integrations."),
+            owner: z.enum(["org", "user"]).optional(),
+            connection: z
+              .string()
+              .trim()
+              .min(1)
+              .optional()
+              .describe(
+                "Exact account name from integrations; pair with integration and owner to select one account.",
+              ),
+            limit: z.number().int().min(1).max(20).default(10),
+            offset: z.number().int().min(0).default(0),
+          },
+          annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        },
+        ({ query, integration, owner, connection, limit, offset }, extra) =>
+          boundary(
+            Effect.gen(function* () {
+              const discovery = {
+                tools: {
+                  list: (filter?: Parameters<McpToolsPort["list"]>[0]) =>
+                    tools
+                      .list({
+                        ...filter,
+                        ...(integration === undefined
+                          ? {}
+                          : { integration: IntegrationSlug.make(integration) }),
+                        ...(owner === undefined ? {} : { owner }),
+                        ...(connection === undefined
+                          ? {}
+                          : { connection: ConnectionName.make(connection) }),
+                      })
+                      .pipe(Effect.map((items) => items.filter((tool) => tool.static !== true))),
+                },
+              };
+              const page = yield* searchTools(discovery, query, limit, { offset });
+              const candidates = yield* Effect.forEach(
+                page.items,
+                (match) =>
+                  Effect.gen(function* () {
+                    const address = ToolAddress.make(`tools.${match.path}`);
+                    const identity = parseToolAddress(String(address));
+                    if (!identity) return null;
+                    const schema = yield* tools.schema(address);
+                    // Visibility can change between listing and schema lookup.
+                    if (!schema) return null;
+                    return {
+                      id: String(address),
+                      name: match.name,
+                      integration: identity.integration,
+                      owner: identity.owner,
+                      connection: identity.connection,
+                      description: match.description,
+                      inputSchema: passthroughInputSchema(schema),
+                      ...(schema.annotations ? { annotations: schema.annotations } : {}),
+                    };
+                  }),
+                { concurrency: 4 },
+              );
+              const result = { ...page, items: candidates.filter(Predicate.isNotNull) };
+              return {
+                content: [{ type: "text" as const, text: JSON.stringify(result) }],
+                structuredContent: result,
+              };
+            }),
+            extra,
+          ),
+      );
+      server.registerTool(
+        "invoke",
+        {
+          description:
+            "Call one connected integration tool using the exact ID and JSON input schema returned by search. May read or change external state. Your client handles approval for this call; workspace blocks remain enforced.",
+          inputSchema: {
+            tool: z.string().min(1).describe("Exact tool ID returned by search."),
+            arguments: z
+              .record(z.string(), z.unknown())
+              .describe("Tool arguments matching the inputSchema returned by search."),
+          },
+          annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+        },
+        ({ tool: id, arguments: args }, extra) =>
+          boundary(
+            Effect.gen(function* () {
+              const identity = parseToolAddress(id);
+              const unavailable = {
+                isError: true,
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Tool not found or blocked by policy. Search for an available tool.",
+                  },
+                ],
+              };
+              if (!identity) return unavailable;
+              const address = ToolAddress.make(id);
+              // Use the existing visibility filter and exclude static configuration tools.
+              const visible = yield* tools.list({
+                integration: identity.integration,
+                owner: identity.owner,
+                connection: identity.connection,
+                query: String(identity.tool),
+                includeAnnotations: false,
+              });
+              if (!visible.some((tool) => tool.static !== true && tool.address === address))
+                return unavailable;
+              const schema = yield* tools.schema(address);
+              if (!schema) return unavailable;
+              // The SDK validator checks this dynamic JSON schema at the MCP boundary.
+              const validate = validator.getValidator<unknown>(
+                passthroughInputSchema(schema) as JsonSchemaType,
+              );
+              const checked = validate(args);
+              if (!checked.valid)
+                return {
+                  isError: true,
+                  content: [
+                    {
+                      type: "text" as const,
+                      text: `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}`,
+                    },
+                  ],
+                };
+              return yield* run(address, checked.data, extra);
+            }),
+            extra,
+          ),
+      );
+    });
+  }).pipe(Effect.withSpan("mcp.host.register_search_invoke"));
+
+// ---------------------------------------------------------------------------
 // Server factory
 // ---------------------------------------------------------------------------
 
 export const createExecutorMcpServer = <E extends Cause.YieldableError>(
   config: ExecutorMcpServerConfig<E>,
-): Effect.Effect<McpServer> =>
+): Effect.Effect<McpServer, McpPassthroughUnavailableError> =>
   Effect.gen(function* () {
     const engine = "engine" in config ? config.engine : createExecutionEngine(config);
     const description =
@@ -1104,10 +1534,31 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
     // One flag decides the whole surface: the tools, the shell resource, and
     // the skills catalog below.
     const artifactsEnabled = config.artifactsEnabled ?? true;
-    const skillCatalog: readonly Skill[] = skillCatalogFor({ artifacts: artifactsEnabled });
+    const skillCatalog: readonly Skill[] =
+      config.mode === "passthrough"
+        ? [
+            SEARCH_INVOKE_SKILL,
+            ...skillCatalogFor({
+              artifacts: artifactsEnabled && config.loadAppShellHtml !== undefined,
+              discovery: "search-invoke",
+            }),
+          ]
+        : skillCatalogFor({ artifacts: artifactsEnabled });
     // Per-integration search tools are off unless this connection opted in
     // (`?search_tools=true`).
     const searchToolsEnabled = config.searchToolsEnabled ?? false;
+    // Passthrough (`?mode=passthrough`) replaces the codemode surface
+    // wholesale. The flag is read once here and every codemode-only
+    // registration below is gated on it, so the two surfaces cannot leak into
+    // each other.
+    const mode: McpToolMode = config.mode ?? "codemode";
+    const passthrough = mode === "passthrough";
+    if (passthrough && (!config.tools || !config.connections || !config.integrations)) {
+      return yield* new McpPassthroughUnavailableError({
+        reason:
+          "passthrough mode requires tool list/schema, connection list, and integration list APIs",
+      });
+    }
 
     // Captured at construction time. SDK callbacks fire later (often
     // deferred past the outer Effect's await), so we use the runtime to
@@ -1183,9 +1634,16 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       const parent = resolveParentSpan();
       return parent ? Effect.withParentSpan(effect, parent) : effect;
     };
-    const runToolEffect = <EffE>(effect: Effect.Effect<McpToolResult, EffE>) =>
+    const runToolEffect = <EffE>(
+      effect: Effect.Effect<McpToolResult, EffE>,
+      extra: McpRequestJoinKeys,
+    ) =>
       Effect.runPromiseWith(context)(
         anchor(effect).pipe(
+          Effect.provideService(
+            CurrentOrgWriteAccess,
+            makeOrgWriteAccessState(requestOrgWriteAccess(extra)),
+          ),
           Effect.catchCause((cause) => Effect.succeed(toMcpFailureResult(cause))),
         ),
       );
@@ -1201,6 +1659,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             // per host.
             capabilities: { resources: {}, tools: {} },
             jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
+            ...(passthrough
+              ? {
+                  instructions: passthroughInstructions(),
+                }
+              : {}),
           },
         ),
     ).pipe(Effect.withSpan("mcp.host.create_server"));
@@ -1383,8 +1846,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 
     const resumeExecution = (
       executionId: string,
-      action: "accept" | "decline" | "cancel",
-      content: Record<string, unknown> | undefined,
+      response: ResumeResponse,
       extra: McpRequestJoinKeys,
     ): Effect.Effect<McpToolResult, E> =>
       Effect.gen(function* () {
@@ -1394,17 +1856,18 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         });
         debugLog("resume.call", {
           executionId,
-          action,
-          hasContent: content !== undefined,
+          action: response.action,
+          hasContent: response.content !== undefined,
+          persist: response.meta?.persist,
           clientCapabilities: server.server.getClientCapabilities() ?? null,
         });
-        const outcome = yield* resumeWithLifecycle(executionId, { action, content });
+        const outcome = yield* resumeWithLifecycle(executionId, response);
         if (!outcome) {
           debugLog("resume.missing_execution", { executionId });
           if (yield* localExecutionAlreadySettled(executionId)) {
             return alreadySettledResult(executionId);
           }
-          const fallback = yield* resumeFallback(executionId, { action, content });
+          const fallback = yield* resumeFallback(executionId, response);
           if (fallback) {
             debugLog("resume.fallback_result", { executionId, status: fallback.status });
             return fallbackOutcomeResult(executionId, fallback);
@@ -1428,7 +1891,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         Effect.withSpan("mcp.host.tool.resume", {
           attributes: {
             "mcp.tool.name": "resume",
-            "mcp.execute.resume.action": action,
+            "mcp.execute.resume.action": response.action,
             "mcp.execute.execution_id": executionId,
           },
         }),
@@ -1458,13 +1921,13 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 
     const takeBrowserApprovalResponse = (
       executionId: string,
-    ): Effect.Effect<ResumeResponse | null> => {
+    ): Effect.Effect<BrowserApprovalDecision | null> => {
       return config.browserApprovalStore?.takeResponse(executionId) ?? Effect.succeed(null);
     };
 
     const waitForBrowserApprovalResponse = (
       executionId: string,
-    ): Effect.Effect<ResumeResponse | null> => {
+    ): Effect.Effect<BrowserApprovalDecision | null> => {
       const waitForResponse = config.browserApprovalStore?.waitForResponse;
       if (!waitForResponse) return takeBrowserApprovalResponse(executionId);
 
@@ -1485,10 +1948,15 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "mcp.tool.name": "resume",
           "mcp.execute.execution_id": executionId,
         });
-        const response = yield* waitForBrowserApprovalResponse(executionId);
-        if (!response) return yield* requireUserResumeApproval(executionId);
+        const decision = yield* waitForBrowserApprovalResponse(executionId);
+        if (!decision) return yield* requireUserResumeApproval(executionId);
 
-        const outcome = yield* resumeWithLifecycle(executionId, response);
+        const outcome = yield* resumeWithLifecycle(executionId, decision.response).pipe(
+          Effect.provideService(
+            CurrentOrgWriteAccess,
+            makeOrgWriteAccessState(decision.orgWriteAccess),
+          ),
+        );
         if (!outcome) {
           return missingExecutionResult(executionId);
         }
@@ -1514,44 +1982,116 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         Effect.annotateSpans(joinKeyAttributes(extra)),
       );
 
+    // --- passthrough call path ---
+    //
+    // Invoke runs one generated call through the existing execution engine.
+    // The client approves the generic destructive tool; upstream prompts use
+    // native elicitation, or fail with an actionable result when unsupported.
+    const executePassthroughCall = (
+      address: ToolAddress,
+      args: unknown,
+      extra: McpRequestJoinKeys,
+    ): Effect.Effect<McpToolResult, E> =>
+      Effect.gen(function* () {
+        yield* startMarker("mcp.host.tool.execute.start", {
+          "mcp.tool.id": String(address),
+          "mcp.tool.mode": "passthrough",
+          "executor.tool.address": address,
+        });
+        const { url: supportsUrl } = getElicitationSupport(server);
+        const native = makeMcpElicitationHandler(server, extra.requestId, debugLog);
+        const { form: supportsForm } = getElicitationSupport(server);
+        // Set when the tool asked the user for something this client cannot
+        // relay. The handler has no error channel (a non-accept is a decline
+        // to the executor), so the request is kept here and the whole call is
+        // reported as unanswerable below — with what was asked, URL included —
+        // instead of as "declined by the user", which nobody did.
+        let unanswerable: ElicitationRequest | undefined;
+        const onElicitation: ElicitationHandler = (ctx) => {
+          // Every invoke is advertised as destructive, so the client's native
+          // approval covers the selected ID and arguments, even if policy changed.
+          // Tool-raised prompts still require their own response below.
+          if (ctx.source === "policy") {
+            return Effect.succeed({ action: "accept" as const, content: {} });
+          }
+          // Anything the tool itself asked for goes to the client natively
+          // when it can take it; the native bridge already turns a URL
+          // request into a form for form-only clients.
+          if (supportsForm || (supportsUrl && Predicate.isTagged(ctx.request, "UrlElicitation"))) {
+            return native(ctx);
+          }
+          unanswerable = ctx.request;
+          return Effect.succeed({ action: "decline" as const });
+        };
+        const outcome = yield* engine.execute(passthroughCallCode(address, args), {
+          onElicitation,
+        });
+        if (unanswerable) return elicitationUnsupportedResult(String(address), unanswerable);
+        return toPassthroughResult(outcome);
+      }).pipe(
+        Effect.withSpan("mcp.host.tool.execute", {
+          attributes: {
+            "mcp.tool.id": String(address),
+            "mcp.tool.mode": "passthrough",
+            "executor.integration": parseToolAddress(String(address))?.integration,
+          },
+        }),
+        Effect.annotateSpans(joinKeyAttributes(extra)),
+      );
+
     // --- tools ---
 
-    yield* Effect.sync(() =>
-      server.registerTool(
-        "execute",
-        {
-          description,
-          inputSchema: { code: z.string().trim().min(1) },
-        },
-        ({ code }, extra) => runToolEffect(executeCode(code, extra)),
-      ),
-    ).pipe(
-      Effect.withSpan("mcp.host.register_tool", {
-        attributes: { "mcp.tool.name": "execute" },
-      }),
-    );
+    // Passthrough serves search and invoke in place of the codemode tools.
+    if (passthrough && config.tools && config.connections && config.integrations) {
+      yield* registerPassthroughTools(
+        server,
+        config.tools,
+        config.connections,
+        config.integrations,
+        executePassthroughCall,
+      );
+    }
+
+    if (!passthrough)
+      yield* Effect.sync(() =>
+        server.registerTool(
+          "execute",
+          {
+            description,
+            inputSchema: { code: z.string().trim().min(1) },
+          },
+          ({ code }, extra) => runToolEffect(executeCode(code, extra), extra),
+        ),
+      ).pipe(
+        Effect.withSpan("mcp.host.register_tool", {
+          attributes: { "mcp.tool.name": "execute" },
+        }),
+      );
 
     yield* Effect.sync(() =>
       server.registerTool(
         "skills",
         {
-          description: [
-            "Documentation for THIS server's own tools. Not a general skill reader: it serves a short, fixed set of how-to docs about using the tools available on this connection, and it cannot reach your harness's skills, a SKILL.md on disk, or any user- or project-authored skill. The argument is a name from its own catalog, never a path or an outside skill's id.",
-            "These docs hold the long-form guidance that would otherwise bloat another tool's always-loaded description.",
-            'Call `skills({ name: "execute" })` for the full guide to writing code for the `execute` tool (search the catalog, call tools, emit results, resume paused runs).',
-            "Call with no name to list the few docs available.",
-          ].join("\n"),
+          annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+          description: passthrough
+            ? 'Documentation for this server only, not harness or project skills. Call with no name to list guides, or skills({ name: "search-invoke" }) for account discovery, tool search, invocation, and pagination.'
+            : [
+                "Documentation for THIS server's own tools. Not a general skill reader: it serves a short, fixed set of how-to docs about using the tools available on this connection, and it cannot reach your harness's skills, a SKILL.md on disk, or any user- or project-authored skill. The argument is a name from its own catalog, never a path or an outside skill's id.",
+                "These docs hold the long-form guidance that would otherwise bloat another tool's always-loaded description.",
+                'Call `skills({ name: "execute" })` for the full guide to writing code for the `execute` tool (search the catalog, call tools, emit results, resume paused runs).',
+                "Call with no name to list the few docs available.",
+              ].join("\n"),
           inputSchema: {
             name: z
               .string()
               .optional()
               .describe(
-                'A doc from this server\'s own catalog, e.g. "execute" — not a path or an outside skill name. Omit to list the catalog.',
+                `A doc from this server's own catalog, e.g. "${passthrough ? "search-invoke" : "execute"}". Omit to list the catalog.`,
               ),
           },
         },
-        ({ name }) =>
-          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog))),
+        ({ name }, extra) =>
+          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog)), extra),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
@@ -1559,56 +2099,73 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       }),
     );
 
-    yield* Effect.sync(() => {
-      if (elicitationMode.mode === "native") {
-        return undefined;
-      }
+    if (!passthrough)
+      yield* Effect.sync(() => {
+        if (elicitationMode.mode === "native") {
+          return undefined;
+        }
 
-      if (elicitationMode.mode === "model") {
+        if (elicitationMode.mode === "model") {
+          return server.registerTool(
+            "resume",
+            {
+              description: [
+                "Resume a paused execution using the executionId returned by execute.",
+                "This connection explicitly allows model-side resume via elicitation_mode=model.",
+              ].join("\n"),
+              inputSchema: {
+                executionId: z.string().describe("The execution ID from the paused result"),
+                action: z
+                  .enum(["accept", "decline", "cancel"])
+                  .describe("How to respond to the interaction"),
+                content: z
+                  .string()
+                  .describe("Optional JSON-encoded response content for form elicitations")
+                  .default("{}"),
+                persist: z
+                  .string()
+                  .optional()
+                  .describe(
+                    "How long an accepted approval lasts, when the paused interaction's terms offer a choice: one of interaction.meta.persist. Omit to approve this call only.",
+                  ),
+              },
+            },
+            ({ executionId, action, content: rawContent, persist }, extra) =>
+              runToolEffect(
+                resumeExecution(
+                  executionId,
+                  {
+                    action,
+                    content: parseJsonContent(rawContent),
+                    ...(persist === undefined ? {} : { meta: { persist } }),
+                  },
+                  extra,
+                ),
+                extra,
+              ),
+          );
+        }
+
         return server.registerTool(
           "resume",
           {
             description: [
-              "Resume a paused execution using the executionId returned by execute.",
-              "This connection explicitly allows model-side resume via elicitation_mode=model.",
+              "Request user approval to resume a paused execution.",
+              "Call this with the executionId returned by execute. If the user has not approved in the browser yet, tell them to open the returned approval URL. If they have approved, this returns the resumed execution result.",
+              "This connection does not allow the model to choose accept, decline, cancel, or content.",
             ].join("\n"),
             inputSchema: {
               executionId: z.string().describe("The execution ID from the paused result"),
-              action: z
-                .enum(["accept", "decline", "cancel"])
-                .describe("How to respond to the interaction"),
-              content: z
-                .string()
-                .describe("Optional JSON-encoded response content for form elicitations")
-                .default("{}"),
             },
           },
-          ({ executionId, action, content: rawContent }, extra) =>
-            runToolEffect(
-              resumeExecution(executionId, action, parseJsonContent(rawContent), extra),
-            ),
+          ({ executionId }, extra) =>
+            runToolEffect(resumeAfterBrowserApproval(executionId, extra), extra),
         );
-      }
-
-      return server.registerTool(
-        "resume",
-        {
-          description: [
-            "Request user approval to resume a paused execution.",
-            "Call this with the executionId returned by execute. If the user has not approved in the browser yet, tell them to open the returned approval URL. If they have approved, this returns the resumed execution result.",
-            "This connection does not allow the model to choose accept, decline, cancel, or content.",
-          ].join("\n"),
-          inputSchema: {
-            executionId: z.string().describe("The execution ID from the paused result"),
-          },
-        },
-        ({ executionId }, extra) => runToolEffect(resumeAfterBrowserApproval(executionId, extra)),
+      }).pipe(
+        Effect.withSpan("mcp.host.register_tool", {
+          attributes: { "mcp.tool.name": "resume" },
+        }),
       );
-    }).pipe(
-      Effect.withSpan("mcp.host.register_tool", {
-        attributes: { "mcp.tool.name": "resume" },
-      }),
-    );
 
     // --- per-integration search tools (opt-in, `?search_tools=true`) ---
     //
@@ -1626,7 +2183,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
     // would only repeat the name) and a single bare `query` parameter — no
     // paging knobs, because anything past the first page belongs in `execute`.
     // `namespace-search-tools.test.ts` pins the serialized size.
-    if (searchToolsEnabled) {
+    if (searchToolsEnabled && !passthrough) {
       // The MCP tool-name grammar ([A-Za-z0-9_-]). Integration slugs already
       // conform (they are `tools.<slug>` property names in sandbox code); one
       // that somehow doesn't is skipped rather than failing the whole session.
@@ -1653,6 +2210,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
                     },
                   }),
                 ),
+                extra,
               ),
           );
         }
@@ -2008,11 +2566,14 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           .pipe(Effect.catchCause(() => Effect.succeed(null)));
         if (!artifact) return artifactNotFoundResult(id);
         yield* notifyArtifactUsage("viewed");
-        return deliverArtifact({
-          code: artifact.code,
-          artifactId: artifact.id,
-          title: artifact.title,
-        });
+        return withArtifactSource(
+          deliverArtifact({
+            code: artifact.code,
+            artifactId: artifact.id,
+            title: artifact.title,
+          }),
+          artifact.code,
+        );
       }).pipe(
         Effect.withSpan("mcp.host.tool.show_artifact", {
           attributes: { "mcp.tool.name": "show-artifact", "mcp.artifact.id": id },
@@ -2062,7 +2623,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               'Call `skills({ name: "create-artifact" })` for the full guide: the discovery-then-render protocol, TanStack Query rules, and every component already in scope. Call `skills({ name: "artifact-style" })` for how it must look — artifacts render inside the Executor console and must match its design system.',
               "Write a component named `App` in `code`. Do not import anything and do not paste fetched data into JSX — read it live with `useQuery(tools.<integration>.<tool>.queryOptions(args))`.",
               "Lay it out as an app, not a document: an artifact may be given the whole viewport, so make the root `flex h-full flex-col`, keep headers and filters as ordinary children, and give the one long table or list `flex-1 min-h-0 overflow-auto` — its header then stays put while the rows scroll under it.",
-              "Artifact code addresses an INTEGRATION, never a connection: write `tools.vercel.domains.getDomains`, not the full `tools.vercel.user.personalVercel.domains.getDomains` address `execute` uses for discovery. The connection is bound when the artifact is saved, so it stays portable. Code containing a `.user.` or `.org.` segment is rejected.",
+              "Artifact code addresses an INTEGRATION, never a connection: write `tools.vercel.domains.getDomains`, not the full `tools.vercel.user.personalVercel.domains.getDomains` address used during discovery. The connection is bound when the artifact is saved, so it stays portable. Code containing a `.user.` or `.org.` segment is rejected.",
               'To use two accounts of the same integration, tag each call site with a role — `tools.linear("prod").issues.list` and `tools.linear("staging").issues.list` — and map every role in `connections`.',
               "All data access is declarative `tools.*`: `.queryOptions()` to read, `.infiniteQueryOptions()` to page through a cursor, `.mutationOptions()` to write. There is no `run()` and no arbitrary code — never hand-roll `useQuery({ queryKey, queryFn })`, or invalidation breaks.",
               "To read every page of a paginated tool, call `useInfiniteQuery(tools.<integration>.<tool>.infiniteQueryOptions(args, { cursorKey, getNextPageParam }))` once and render `data.pages`. Never call hooks inside a loop — a `useQuery` per page is rejected.",
@@ -2083,7 +2644,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
                 .record(z.string(), z.string())
                 .optional()
                 .describe(
-                  'Which connection each integration role in `code` uses, as `<integration>.<user|org>.<connection>` (the address `connections.list` reports, minus the leading `tools.`). Keys are roles: the integration slug for an untagged `tools.linear.…`, or the tag for `tools.linear("prod").…`. Optional when you have exactly one connection per integration used — that one binds automatically. Required when you have several, and the error lists them.',
+                  'Which connection each integration role in `code` uses, as `<integration>.<user|org>.<connection>` (use the integration, owner, and connection from discovery). Keys are roles: the integration slug for an untagged `tools.linear.…`, or the tag for `tools.linear("prod").…`. Optional when you have exactly one connection per integration used — that one binds automatically. Required when you have several, and the error lists them.',
                 ),
               title: z
                 .string()
@@ -2104,8 +2665,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ code, title, description, connections, artifactId }) =>
-            runToolEffect(createArtifact({ code, title, description, connections, artifactId })),
+          ({ code, title, description, connections, artifactId }, extra) =>
+            runToolEffect(
+              createArtifact({ code, title, description, connections, artifactId }),
+              extra,
+            ),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2170,8 +2734,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ artifactId, edits, connections, title, description }) =>
-            runToolEffect(editArtifact({ artifactId, edits, connections, title, description })),
+          ({ artifactId, edits, connections, title, description }, extra) =>
+            runToolEffect(
+              editArtifact({ artifactId, edits, connections, title, description }),
+              extra,
+            ),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2189,7 +2756,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             ].join("\n"),
             inputSchema: {},
           },
-          () => runToolEffect(listArtifacts()),
+          (_args, extra) => runToolEffect(listArtifacts(), extra),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2205,7 +2772,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             description: [
               "Re-render a saved UI artifact by id.",
               "Use `list-artifacts` first to find the id whose title or description matches what the user asked for.",
-              "Clients that cannot display MCP apps receive a link to the artifact instead.",
+              "Returns the artifact's current source. Clients that cannot display MCP apps also receive a link to the artifact; pass it to the user.",
             ].join("\n"),
             inputSchema: {
               id: z.string().trim().min(1).describe("The artifact id from `list-artifacts`."),
@@ -2214,7 +2781,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
             },
           },
-          ({ id }) => runToolEffect(showArtifact(id)),
+          ({ id }, extra) => runToolEffect(showArtifact(id), extra),
         ),
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
@@ -2245,7 +2812,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             },
           },
           ({ code, artifactId }, extra) =>
-            runToolEffect(executeCodeFromApp(code, artifactId, extra)),
+            runToolEffect(executeCodeFromApp(code, artifactId, extra), extra),
         );
 
         executeActionResumeTool = registerAppTool(
@@ -2269,7 +2836,12 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           },
           ({ executionId, action, content: rawContent }, extra) =>
             runToolEffect(
-              resumeExecution(executionId, action, parseJsonContent(rawContent), extra),
+              resumeExecution(
+                executionId,
+                { action, content: parseJsonContent(rawContent) },
+                extra,
+              ),
+              extra,
             ),
         );
       }).pipe(

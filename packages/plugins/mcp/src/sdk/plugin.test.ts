@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Effect, Exit, Layer, Option, Predicate, Schema, Tracer } from "effect";
+import { fileURLToPath } from "node:url";
 import {
   HttpClient,
   HttpClientRequest,
@@ -24,7 +25,7 @@ import {
 } from "@executor-js/sdk/testing";
 
 import { createMcpConnector } from "./connection";
-import { mcpPlugin, userFacingProbeMessage } from "./plugin";
+import { mcpPlugin, userFacingProbeMessage, toIntegrationConfig } from "./plugin";
 import { McpInvocationError } from "./errors";
 import { extractManifestFromListToolsResult, deriveMcpNamespace, joinToolPath } from "./manifest";
 import { makeAnnotationsMcpServer, serveMcpServer } from "../testing";
@@ -38,6 +39,9 @@ import { makeAnnotationsMcpServer, serveMcpServer } from "../testing";
 // elicitation.test.ts + owner-isolation.test.ts.
 
 const TEMPLATE = AuthTemplateSlug.make("none");
+const stdioNegotiationFixture = fileURLToPath(
+  new URL("./stdio-negotiation-test-server.ts", import.meta.url),
+);
 
 const JsonRpcId = Schema.Union([Schema.String, Schema.Number, Schema.Null]);
 const JsonRpcRequest = Schema.Struct({
@@ -1136,13 +1140,76 @@ describe("mcpPlugin", () => {
         expect(Predicate.isTagged(failure, "ToolInvocationError")).toBe(true);
 
         const error = failure as { readonly message: string; readonly cause?: unknown };
-        expect(error).toMatchObject({ message: "MCP tool call failed for explode" });
+        // The defect log renders only the message, so it names the SDK
+        // rejection (class + code) without carrying the upstream body.
+        expect(error).toMatchObject({
+          message:
+            "MCP tool call failed for explode (SdkHttpError CLIENT_HTTP_NOT_IMPLEMENTED HTTP 500)",
+        });
         expect(error).toMatchObject({ message: expect.not.stringContaining("do-not-leak") });
         expect(Predicate.isTagged(error.cause, "McpInvocationError")).toBe(true);
         const cause = error.cause as McpInvocationError;
         expect(cause.status).toBe(500);
         expect(cause).toMatchObject({ message: expect.not.stringContaining("do-not-leak") });
         expect("cause" in cause).toBe(false);
+      }),
+    ),
+  );
+
+  // Stripe's MCP validates the OAuth account context at the HTTP layer: a
+  // call without `stripe_context` gets a 422 whose JSON body names the missing
+  // field. That is the server refusing THIS call, so it must reach the caller
+  // as a typed failure carrying the server's message — the same treatment as
+  // a JSON-RPC invalid-params refusal — not scrub into an opaque defect.
+  it.effect("surfaces a 4xx JSON refusal from tools/call as a typed tool failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { executor, toolAddress } = yield* seedCallToolExecutor({
+          slug: "call_http_422",
+          callTool: () =>
+            HttpServerResponse.jsonUnsafe(
+              { message: "stripe_context is required for this tool" },
+              { status: 422 },
+            ),
+        });
+
+        const result = yield* executor.execute(toolAddress, {}, { onElicitation: "accept-all" });
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            code: "mcp_tool_error",
+            message: "stripe_context is required for this tool",
+            status: 422,
+            retryable: false,
+            details: { upstream: { status: 422 } },
+          },
+        });
+        expect(result).not.toMatchObject({ error: { details: { category: "authentication" } } });
+      }),
+    ),
+  );
+
+  // A bodyless 4xx (or a body that is not a JSON object) has no message the
+  // caller can act on, so it keeps the opaque-defect path: nothing from the
+  // transport error text is copied out.
+  it.effect("keeps a 4xx without a JSON message opaque", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { executor, toolAddress } = yield* seedCallToolExecutor({
+          slug: "call_http_422_text",
+          callTool: httpStatusCallTool(422),
+        });
+
+        const failure = yield* executor
+          .execute(toolAddress, {}, { onElicitation: "accept-all" })
+          .pipe(Effect.flip);
+        expect(Predicate.isTagged(failure, "ToolInvocationError")).toBe(true);
+        const error = failure as { readonly message: string; readonly cause?: unknown };
+        expect(error).toMatchObject({ message: expect.not.stringContaining("do-not-leak") });
+        const cause = error.cause as McpInvocationError;
+        expect(cause.status).toBe(422);
+        expect(cause.httpRefusal).toBeUndefined();
       }),
     ),
   );
@@ -1155,17 +1222,57 @@ describe("mcpPlugin", () => {
           callTool: jsonRpcErrorCallTool(401),
         });
 
-        const failure = yield* executor
-          .execute(toolAddress, {}, { onElicitation: "accept-all" })
-          .pipe(Effect.flip);
-        expect(Predicate.isTagged(failure, "ToolInvocationError")).toBe(true);
+        const result = yield* executor.execute(toolAddress, {}, { onElicitation: "accept-all" });
 
-        const error = failure as { readonly message: string; readonly cause?: unknown };
-        expect(error).toMatchObject({ message: "MCP tool call failed for explode" });
-        expect(error).toMatchObject({ message: expect.not.stringContaining("do-not-leak") });
-        expect(Predicate.isTagged(error.cause, "McpInvocationError")).toBe(true);
-        const cause = error.cause as McpInvocationError;
-        expect(cause.status).toBeUndefined();
+        // A JSON-RPC error code is not an HTTP status: 401 here is the
+        // server's application-level answer, not an auth wall.
+        expect(result).toMatchObject({
+          ok: false,
+          error: { code: "mcp_tool_error", details: { jsonrpc: { code: 401 } } },
+        });
+        expect(result).not.toMatchObject({ error: { status: 401 } });
+        expect(result).not.toMatchObject({ error: { details: { category: "authentication" } } });
+      }),
+    ),
+  );
+
+  // A server that validates arguments itself (Stripe's MCP, for one) refuses a
+  // bad call with `-32602 Invalid params` and a message naming the offending
+  // field. That answer is for the caller: without it the model cannot fix the
+  // arguments, and scrubbing it into "Internal tool error [id]" reads as an
+  // outage of the whole integration.
+  it.effect("surfaces a JSON-RPC invalid-params refusal as a typed tool failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { executor, toolAddress } = yield* seedCallToolExecutor({
+          slug: "call_jsonrpc_invalid_params",
+          callTool: (rpc) =>
+            HttpServerResponse.jsonUnsafe({
+              jsonrpc: "2.0",
+              id: rpc.id ?? null,
+              error: {
+                code: -32602,
+                message:
+                  "Invalid method parameters: The property '#/intent' value \"x\" did not match one of the following values: a, b",
+              },
+            }),
+        });
+
+        const result = yield* executor.execute(
+          toolAddress,
+          { intent: "x" },
+          { onElicitation: "accept-all" },
+        );
+
+        expect(result).toMatchObject({
+          ok: false,
+          error: {
+            code: "mcp_tool_error",
+            message: expect.stringContaining("'#/intent'"),
+            retryable: false,
+            details: { jsonrpc: { code: -32602 } },
+          },
+        });
       }),
     ),
   );
@@ -1535,4 +1642,275 @@ describe("mcpPlugin endpoint telemetry", () => {
       expect(serialized).not.toContain(QUERY_TOKEN);
     }),
   );
+});
+
+describe("stdio static env", () => {
+  it.effect("uses stored credentials instead of legacy inline stdio env at runtime", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const config = makeTestConfig({
+          plugins: [
+            memoryCredentialsPlugin(),
+            mcpPlugin({ dangerouslyAllowStdioMCP: true }),
+          ] as const,
+        });
+        const executor = yield* Effect.acquireRelease(createExecutor(config), (executor) =>
+          executor
+            .close()
+            .pipe(Effect.orDie, Effect.ensuring(Effect.promise(() => config.testDb.close()))),
+        );
+        const integration = IntegrationSlug.make("legacy-stdio-with-auth");
+
+        yield* executor.mcp.addServer({
+          name: "Legacy stdio with auth",
+          endpoint: "http://127.0.0.1:1/mcp",
+          slug: String(integration),
+        });
+        yield* executor.mcp.configureServer(String(integration), {
+          transport: "stdio",
+          command: "bun",
+          args: ["run", stdioNegotiationFixture],
+          env: { API_KEY: "legacy-secret" },
+        });
+
+        const projected = yield* executor.integrations.get(integration);
+        expect(projected?.authMethods).toEqual([
+          {
+            id: "env",
+            label: "Environment variables",
+            kind: "apikey",
+            template: "env",
+            placements: [{ carrier: "env", name: "API_KEY", prefix: "", variable: "API_KEY" }],
+          },
+        ]);
+
+        const error = yield* executor.connections
+          .create({
+            owner: "org",
+            name: ConnectionName.make("empty"),
+            integration,
+            template: AuthTemplateSlug.make("env"),
+            values: {},
+          })
+          .pipe(Effect.flip);
+        expect(error).toMatchObject({
+          _tag: "InvalidConnectionInputError",
+          message: "A connection must supply at least one credential input.",
+        });
+        expect(yield* executor.connections.list({ integration })).toEqual([]);
+
+        yield* executor.connections.create({
+          owner: "org",
+          name: ConnectionName.make("fresh"),
+          integration,
+          template: AuthTemplateSlug.make("env"),
+          values: { API_KEY: "fresh-secret" },
+        });
+
+        const result = yield* executor.execute(
+          ToolAddress.make("tools.legacy-stdio-with-auth.org.fresh.read_env"),
+          { name: "API_KEY" },
+        );
+        expect(result).toMatchObject({
+          ok: true,
+          data: {
+            content: [{ type: "text", text: "fresh-secret" }],
+          },
+        });
+      }),
+    ),
+  );
+
+  it.effect("projects legacy stdio without inline env as no-auth and accepts empty values", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const config = makeTestConfig({
+          plugins: [
+            memoryCredentialsPlugin(),
+            mcpPlugin({ dangerouslyAllowStdioMCP: true }),
+          ] as const,
+        });
+        const executor = yield* Effect.acquireRelease(createExecutor(config), (executor) =>
+          executor
+            .close()
+            .pipe(Effect.orDie, Effect.ensuring(Effect.promise(() => config.testDb.close()))),
+        );
+        const integration = IntegrationSlug.make("legacy-stdio-without-auth");
+
+        yield* executor.mcp.addServer({
+          name: "Legacy stdio without auth",
+          endpoint: "http://127.0.0.1:1/mcp",
+          slug: String(integration),
+        });
+        yield* executor.mcp.configureServer(String(integration), {
+          transport: "stdio",
+          command: "bun",
+          args: ["run", stdioNegotiationFixture],
+        });
+
+        const projected = yield* executor.integrations.get(integration);
+        expect(projected?.authMethods).toEqual([
+          {
+            id: "none",
+            label: "No authentication",
+            kind: "none",
+            template: "none",
+          },
+        ]);
+
+        const connection = yield* executor.connections.create({
+          owner: "org",
+          name: ConnectionName.make("public"),
+          integration,
+          template: AuthTemplateSlug.make("none"),
+          values: {},
+        });
+        expect(String(connection.address)).toBe("tools.legacy-stdio-without-auth.org.public");
+        expect(yield* executor.connections.list({ integration })).toHaveLength(1);
+      }),
+    ),
+  );
+
+  it.effect(
+    "rejects credential input for legacy no-auth stdio and accepts an empty input map",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const config = makeTestConfig({
+            plugins: [
+              memoryCredentialsPlugin(),
+              mcpPlugin({ dangerouslyAllowStdioMCP: true }),
+            ] as const,
+          });
+          const executor = yield* Effect.acquireRelease(createExecutor(config), (executor) =>
+            executor
+              .close()
+              .pipe(Effect.orDie, Effect.ensuring(Effect.promise(() => config.testDb.close()))),
+          );
+          const integration = IntegrationSlug.make("legacy-stdio-no-auth-create");
+
+          yield* executor.mcp.addServer({
+            name: "Legacy stdio no-auth create",
+            endpoint: "http://127.0.0.1:1/mcp",
+            slug: String(integration),
+          });
+          yield* executor.mcp.configureServer(String(integration), {
+            transport: "stdio",
+            command: "bun",
+            args: ["run", stdioNegotiationFixture],
+          });
+
+          const error = yield* executor.connections
+            .create({
+              owner: "org",
+              name: ConnectionName.make("with-secret"),
+              integration,
+              template: AuthTemplateSlug.make("none"),
+              value: "must-not-be-stored",
+            })
+            .pipe(Effect.flip);
+          expect(error).toMatchObject({
+            _tag: "InvalidConnectionInputError",
+            message: "A no-auth connection cannot accept credential inputs.",
+          });
+          expect(yield* executor.connections.list({ integration })).toEqual([]);
+
+          const connection = yield* executor.connections.create({
+            owner: "org",
+            name: ConnectionName.make("public"),
+            integration,
+            template: AuthTemplateSlug.make("none"),
+            values: {},
+          });
+          expect(String(connection.address)).toBe("tools.legacy-stdio-no-auth-create.org.public");
+          expect(yield* executor.connections.list({ integration })).toHaveLength(1);
+        }),
+      ),
+  );
+
+  it.effect("reconciles a legacy no-secret stdio integration with its default connection", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const config = makeTestConfig({
+          plugins: [
+            memoryCredentialsPlugin(),
+            mcpPlugin({ dangerouslyAllowStdioMCP: true }),
+          ] as const,
+        });
+        const executor = yield* Effect.acquireRelease(createExecutor(config), (executor) =>
+          executor
+            .close()
+            .pipe(Effect.orDie, Effect.ensuring(Effect.promise(() => config.testDb.close()))),
+        );
+        const slug = "legacy-stdio-no-auth";
+
+        yield* executor.mcp.addServer({
+          name: "Legacy stdio no auth",
+          endpoint: "http://127.0.0.1:1/mcp",
+          slug,
+        });
+        yield* executor.mcp.configureServer(slug, {
+          transport: "stdio",
+          command: "bun",
+          args: ["run", stdioNegotiationFixture],
+        });
+
+        const projected = yield* executor.integrations.get(IntegrationSlug.make(slug));
+        expect(projected?.authMethods).toEqual([
+          {
+            id: "none",
+            label: "No authentication",
+            kind: "none",
+            template: "none",
+          },
+        ]);
+
+        yield* executor.mcp.reconcileStdioConnections();
+
+        const connections = yield* executor.connections.list({
+          integration: IntegrationSlug.make(slug),
+        });
+        expect(connections).toHaveLength(1);
+        expect(String(connections[0]?.name)).toBe("default");
+
+        const tools = yield* executor.tools.list({ integration: IntegrationSlug.make(slug) });
+        expect(tools.map((tool) => String(tool.name))).toContain("add");
+      }),
+    ),
+  );
+
+  it("keeps non-secret env off the credential surface", () => {
+    // `env` declares a credential the user must type; `staticEnv` is machine
+    // knowledge stored on the integration. A path the scanner already resolved
+    // belongs in the second, or adding the integration asks for it.
+    const config = toIntegrationConfig({
+      transport: "stdio",
+      name: "Computer Use",
+      command: "/usr/local/bin/codex",
+      args: ["app-server"],
+      staticEnv: { CODEX_HOME: "/home/a/.codex" },
+    });
+
+    expect(config).toMatchObject({
+      env: { CODEX_HOME: "/home/a/.codex" },
+      authenticationTemplate: [{ slug: "none", kind: "none" }],
+    });
+  });
+
+  it("still treats declared env values as credentials", () => {
+    const config = toIntegrationConfig({
+      transport: "stdio",
+      name: "Secret server",
+      command: "run",
+      env: { API_KEY: "sk-live" },
+    });
+
+    expect(config).toMatchObject({
+      authenticationTemplate: [{ slug: "env", kind: "stdio_env", vars: ["API_KEY"] }],
+    });
+    expect(
+      (config as { env?: unknown }).env,
+      "the secret never lands in the config",
+    ).toBeUndefined();
+  });
 });

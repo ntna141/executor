@@ -44,7 +44,11 @@ export const resolveOrganization = (organizationId: string) =>
     const workos = yield* WorkOSClient;
     const fresh = yield* workos.getOrganization(organizationId);
     return yield* users.use("upsertOrganization", (s) =>
-      s.upsertOrganization({ id: fresh.id, name: fresh.name }),
+      s.upsertOrganization({
+        id: fresh.id,
+        name: fresh.name,
+        updatedAt: new Date(fresh.updatedAt),
+      }),
     );
   });
 
@@ -88,7 +92,14 @@ export const authorizeOrganization = (userId: string, organizationId: string) =>
     );
     if (!active) return null;
 
-    return yield* resolveOrganization(organizationId);
+    const org = yield* resolveOrganization(organizationId);
+    // The membership row already names the caller's role — surface it
+    // normalized so identity resolution can bind the executor's workspace
+    // write permission without a second WorkOS call. WorkOS issues
+    // `admin` / `member`; anything unrecognized stays a plain member.
+    const roleSlug = (active as { readonly role?: { readonly slug?: string } }).role?.slug;
+    const memberRole: "admin" | "member" = roleSlug === "admin" ? "admin" : "member";
+    return { ...org, memberRole };
   });
 
 // ---------------------------------------------------------------------------

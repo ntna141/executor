@@ -60,11 +60,19 @@ export interface OAuthTestServerOptions {
   readonly defaultPassword?: string;
   readonly defaultClientId?: string;
   readonly defaultClientSecret?: string;
+  readonly defaultTokenEndpointAuthMethod?: "client_secret_post" | "client_secret_basic";
   readonly clients?: Readonly<Record<string, string | null>>;
   readonly scopes?: readonly string[];
   readonly omitTokenResponseScopes?: readonly string[];
   readonly supportRefresh?: boolean;
   readonly tokenExpiresInSeconds?: number;
+  /** Refuse a refresh-token grant whose `scope` parameter names anything outside
+   *  this list, answering the RFC 6749 §5.2 envelope Railway returns:
+   *  `invalid_scope: refresh token missing requested scope`. Models an AS whose
+   *  refresh token carries a narrower grant than the authorization it echoed
+   *  back, so a client that re-sends its recorded grant is refused (issue
+   *  #1969). Omit to accept any `scope`, the default. */
+  readonly refreshGrantScopes?: readonly string[];
   readonly invalidRefreshTokenDescription?: string;
   /** RFC 6749 error code returned when a refresh-token grant is rejected.
    *  Defaults to `invalid_grant`; set to e.g. `invalid_request` to mirror
@@ -257,9 +265,11 @@ const decodeBasicAuthorization = (
   const decoded = Buffer.from(match[1]!, "base64").toString("utf8");
   const separator = decoded.indexOf(":");
   if (separator < 0) return null;
+  const decodeFormComponent = (component: string): string =>
+    new URLSearchParams(`value=${component}`).get("value") ?? component;
   return {
-    username: decoded.slice(0, separator),
-    password: decoded.slice(separator + 1),
+    username: decodeFormComponent(decoded.slice(0, separator)),
+    password: decodeFormComponent(decoded.slice(separator + 1)),
   };
 };
 
@@ -566,7 +576,7 @@ export const serveOAuthTestServer = (
     clients.set(defaultClientId, {
       clientSecret: defaultClientSecret,
       redirectUris: new Set(),
-      tokenEndpointAuthMethod: "client_secret_post",
+      tokenEndpointAuthMethod: options.defaultTokenEndpointAuthMethod ?? "client_secret_post",
     });
     for (const [clientId, clientSecret] of Object.entries(options.clients ?? {})) {
       clients.set(clientId, {
@@ -787,6 +797,12 @@ export const serveOAuthTestServer = (
           if (!clientId || !client) {
             return oauthError(401, "invalid_client", "Unknown client");
           }
+          if (
+            (client.tokenEndpointAuthMethod === "client_secret_basic" && !basic) ||
+            (client.tokenEndpointAuthMethod === "client_secret_post" && basic)
+          ) {
+            return oauthError(401, "invalid_client", "Wrong client authentication method");
+          }
           if (client.clientSecret !== null && client.clientSecret !== clientSecret) {
             return oauthError(401, "invalid_client", "Invalid client secret");
           }
@@ -843,6 +859,17 @@ export const serveOAuthTestServer = (
                     contentType: rejection.contentType ?? "text/plain; charset=utf-8",
                   })
                 : oauthError(400, invalidRefreshTokenErrorCode, invalidRefreshTokenDescription);
+            }
+            const grantScopes = options.refreshGrantScopes;
+            if (grantScopes) {
+              const granted = new Set(grantScopes);
+              const requestedScope = params.get("scope");
+              const outsideGrant = (requestedScope ?? "")
+                .split(/[\s,]+/)
+                .filter((scope) => scope.length > 0 && !granted.has(scope));
+              if (outsideGrant.length > 0) {
+                return oauthError(400, "invalid_scope", "refresh token missing requested scope");
+              }
             }
             const nextAccessToken = `at_${randomUUID()}`;
             const nextRefreshToken = `rt_${randomUUID()}`;

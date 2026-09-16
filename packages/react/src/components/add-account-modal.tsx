@@ -27,6 +27,7 @@ import {
   checkConnectionHealth,
   connectionsAllAtom,
   createOAuthClientOptimistic,
+  integrationAtom,
   integrationHealthCheckAtom,
   integrationHealthCheckCandidatesAtom,
   oauthClientsOptimisticAtom,
@@ -51,10 +52,11 @@ import { FreeformCombobox, type FreeformComboboxOption } from "./combobox";
 import { messageFromExit } from "../api/error-reporting";
 import { trackEvent } from "../api/analytics";
 import { useOrganizationId } from "../api/organization-context";
+import { useCanCreateWorkspaceConnections } from "../multiplayer/use-admin-nav";
 import { ownerLabel, ownerLabelForHost, useOwnerDisplay } from "../api/owner-display";
 import {
   ConnectionOwnerDropdown,
-  connectionOwnerOptionsForHost,
+  connectionOwnerOptionsForAccess,
   defaultConnectionOwnerForHost,
   normalizeConnectionOwner,
   resolveOAuthConnectionOwnerForHost,
@@ -85,6 +87,7 @@ import {
 } from "./oauth-client-form";
 import { RemoveOAuthAppDialog } from "./remove-oauth-app-dialog";
 import { AddCustomMethodForm, type CreateCustomMethod } from "./add-custom-method-modal";
+import { CredentialGuidancePanel } from "./credential-guidance";
 import { PlacementLine, type AuthMethod } from "../lib/auth-placements";
 import { connectionIdentifier } from "../lib/connection-name";
 import { Badge } from "./badge";
@@ -624,6 +627,14 @@ export const connectionExistsMessage = (label: string): string =>
 /** The default owner a new connection is saved under when the user makes no
  *  explicit choice. Personal: a connection is most often a personal credential. */
 export const DEFAULT_CONNECTION_OWNER: Owner = "user";
+
+/** The method the modal opens on. OAuth needs a registered app (or a DCR
+ *  round-trip) before "Connect" does anything; a key is one paste. When an
+ *  integration declares both, starting on OAuth greets most users with
+ *  "Register app" — a dead end — while the working method sits one tab over.
+ *  Prefer the first non-OAuth method; OAuth stays one click away. */
+export const preferredMethodId = (methods: readonly AuthMethod[]): string =>
+  (methods.find((method) => method.kind !== "oauth") ?? methods[0])?.id ?? "";
 
 const authMethodKey = (method: AuthMethod): string =>
   method.source === "custom" ? `custom:${String(method.template)}` : `declared:${method.id}`;
@@ -1396,16 +1407,25 @@ function AddAccountModalView(props: AddAccountModalProps) {
     open,
     onOpenChange,
     initialState,
-    createCustomMethod,
-    removeCustomMethod,
+    createCustomMethod: requestedCreateCustomMethod,
+    removeCustomMethod: requestedRemoveCustomMethod,
   } = props;
   const organizationId = useOrganizationId();
   const ownerDisplay = useOwnerDisplay();
-  const ownerOptions = useMemo(
-    () => connectionOwnerOptionsForHost(organizationId),
-    [organizationId],
-  );
+  const canCreateWorkspaceConnections = useCanCreateWorkspaceConnections();
+  const ownerOptions = useMemo(() => {
+    return connectionOwnerOptionsForAccess(organizationId, canCreateWorkspaceConnections);
+  }, [canCreateWorkspaceConnections, organizationId]);
   const defaultOwner = defaultConnectionOwnerForHost(organizationId);
+  // Custom methods mutate the workspace-wide integration catalog, so they stay
+  // admin-only even though members can add Personal connections using methods
+  // that an admin has already configured.
+  const createCustomMethod = canCreateWorkspaceConnections
+    ? requestedCreateCustomMethod
+    : undefined;
+  const removeCustomMethod = canCreateWorkspaceConnections
+    ? requestedRemoveCustomMethod
+    : undefined;
 
   // The selectable methods: the declared ones plus any custom method created in
   // this session (so a just-created method shows + can be selected before the
@@ -1423,7 +1443,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
   );
   const [addingMethod, setAddingMethod] = useState(false);
 
-  const [methodId, setMethodId] = useState<string>(methods[0]?.id ?? "");
+  const [methodId, setMethodId] = useState<string>(preferredMethodId(methods));
   // One value per distinct credential input (`variable → pasted value`). A
   // single-secret method has just `{ token }`; a method with two distinct inputs
   // (e.g. Datadog's two keys) collects one value per variable.
@@ -1501,6 +1521,12 @@ function AddAccountModalView(props: AddAccountModalProps) {
   // The integration's declared health check + its candidate operations. When a
   // check is configured we probe against it; when not, the user picks one of the
   // candidates inline to test the key (and we save it).
+  // The integration's display URL is how the registry's credential guidance is
+  // located — it names the provider this key belongs to.
+  const integrationRecord = useAtomValue(integrationAtom(integration));
+  const integrationDisplayUrl = AsyncResult.isSuccess(integrationRecord)
+    ? integrationRecord.value?.displayUrl
+    : undefined;
   const healthCheckResult = useAtomValue(integrationHealthCheckAtom(integration));
   const configuredHealthCheck = AsyncResult.isSuccess(healthCheckResult)
     ? healthCheckResult.value
@@ -1605,7 +1631,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
             m.id === initialState.template || String(m.template) === initialState.template,
         )
       : undefined;
-    setMethodId(initialMethod?.id ?? allMethods[0]!.id);
+    setMethodId(initialMethod?.id ?? preferredMethodId(allMethods));
   }, [allMethods, initialState?.template, methodId]);
 
   // Non-secret prefill carried by an `oauth.clients.createHandoff` deep link.
@@ -1863,6 +1889,9 @@ function AddAccountModalView(props: AddAccountModalProps) {
   ): { readonly onEdit: () => void; readonly onRemove: () => void } | undefined => {
     // First-party apps are host config, not rows: nothing to edit or remove.
     if (appOption.origin.kind === "first_party") return undefined;
+    // Members may use a shared app to mint their own Personal connection, but
+    // only admins may edit or remove that Workspace-owned app.
+    if (appOption.owner === "org" && !canCreateWorkspaceConnections) return undefined;
     const summary = clientSummaries.find(
       (c: OAuthClientSummary) =>
         c.owner === appOption.owner && String(c.slug) === String(appOption.slug),
@@ -2717,6 +2746,7 @@ function AddAccountModalView(props: AddAccountModalProps) {
                   resource: editingClient.resource ?? null,
                   grant: editingClient.grant,
                   clientId: editingClient.clientId,
+                  tokenEndpointAuthMethod: editingClient.tokenEndpointAuthMethod,
                 }}
                 onCreated={() => setEditingClient(null)}
                 onCancel={() => setEditingClient(null)}
@@ -2798,7 +2828,9 @@ function AddAccountModalView(props: AddAccountModalProps) {
               </DialogTitle>
               <DialogDescription>
                 {ownerDisplay.showOwnerLabels
-                  ? "A connection is a saved way to use this integration, owned by you or the workspace."
+                  ? canCreateWorkspaceConnections
+                    ? "A connection is a saved way to use this integration, owned by you or the workspace."
+                    : "A connection is a saved way to use this integration, owned by you."
                   : "A connection is a saved way to use this integration."}
               </DialogDescription>
             </DialogHeader>
@@ -2893,6 +2925,15 @@ function AddAccountModalView(props: AddAccountModalProps) {
                       {!isNoAuth && (
                         <div className="space-y-2">
                           <StepHeader index={1} label={authStepLabel} />
+
+                          {/* What this key is called at the provider, the page
+                              that mints it, and their own setup steps. The
+                              question this dialog used to ask without
+                              answering. */}
+                          <CredentialGuidancePanel
+                            displayUrl={integrationDisplayUrl}
+                            methodKind={method?.kind}
+                          />
 
                           {isOAuth && method ? (
                             cimdActive ? (

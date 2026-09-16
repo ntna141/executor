@@ -12,6 +12,7 @@ describe("isMarketingPath", () => {
     "/home",
     "/privacy",
     "/terms",
+    "/pricing",
     "/about-executor",
     "/google-oauth",
     "/google-workspace",
@@ -19,6 +20,9 @@ describe("isMarketingPath", () => {
     "/blog/",
     "/blog/some-post",
     "/llms.txt",
+    "/index.md",
+    "/setup-prompt.md",
+    "/pricing.md",
     "/og-image.png",
     "/_astro/app.css",
     // The blog author card loads its avatar from marketing's public/authors;
@@ -64,6 +68,12 @@ describe("marketingProxyRequest", () => {
     });
 
     expect(marketingProxyRequest(request)?.url).toBe("https://executor.sh/blog/post");
+  });
+
+  it("routes /pricing to the marketing worker", () => {
+    const request = new Request("https://executor.sh/pricing");
+
+    expect(marketingProxyRequest(request)?.url).toBe("https://executor.sh/pricing");
   });
 
   it("rewrites the public home alias to the marketing root", () => {

@@ -103,6 +103,7 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
             grant: payload.grant,
             clientId: payload.clientId,
             clientSecret: payload.clientSecret,
+            tokenEndpointAuthMethod: payload.tokenEndpointAuthMethod,
             resource: payload.resource ?? null,
             origin: { kind: "manual", integration: payload.originIntegration ?? null },
           });
@@ -211,13 +212,16 @@ export const OAuthHandlers = HttpApiBuilder.group(ExecutorApi, "oauth", (handler
           const html = yield* runOAuthCallback({
             complete: ({ state, code, callbackDomain }) =>
               executor.oauth
-                .complete({
-                  // `runOAuthCallback`'s `state` is a raw string from the URL;
-                  // the SDK speaks the branded `OAuthState` (nominal brand).
-                  state: OAuthState.make(state),
-                  code: code ?? "",
-                  callbackDomain,
-                })
+                .complete(
+                  {
+                    // `runOAuthCallback`'s `state` is a raw string from the URL;
+                    // the SDK speaks the branded `OAuthState` (nominal brand).
+                    state: OAuthState.make(state),
+                    code: code ?? "",
+                    callbackDomain,
+                  },
+                  { toolSync: "background" },
+                )
                 .pipe(
                   Effect.tapError((cause: unknown) =>
                     Effect.logError("OAuth callback completion failed", cause),

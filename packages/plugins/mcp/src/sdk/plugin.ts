@@ -25,6 +25,7 @@ import {
   type IntegrationConfig,
   type IntegrationRecord,
   type OAuthClientSummary,
+  type OrgWriteDeniedError,
   type Owner,
   type PluginCtx,
   type StaticToolSchema,
@@ -42,9 +43,10 @@ import {
   requiredPlacementVariables,
 } from "@executor-js/sdk/http-auth";
 
+import type { CodexPluginEntry } from "./codex-plugins";
 import { createMcpConnector, type ConnectorInput, type McpConnector } from "./connection";
 import { createMcpConnectionPool } from "./connection-pool";
-import { discoverTools } from "./discover";
+import { discoverToolsFromInput } from "./discover";
 import {
   McpConnectionError,
   type McpConnectionFailureKind,
@@ -217,6 +219,10 @@ const McpRemoteServerInputSchema = Schema.Struct({
   /** Single-method shorthand (legacy callers). Ignored when
    *  `authenticationTemplate` is present. Defaults to none. */
   auth: Schema.optional(McpAuthShorthand),
+  /** Pin protocol negotiation. `legacy` is for servers that echo the proposed
+   *  2026-07-28 revision and then violate its response contract; the probe
+   *  reports when it had to fall back, and the add flow passes that through. */
+  versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
 });
 
 const McpStdioServerInputSchema = Schema.Struct({
@@ -235,12 +241,37 @@ const McpStdioServerInputSchema = Schema.Struct({
    *  add then auto-creates the connection holding them. The UI uses `envVars`
    *  instead and leaves the values to the connect step. */
   env: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  /** Non-secret environment the server needs, stored on the integration and
+   *  injected verbatim at spawn.
+   *
+   *  Separate from `env` because that channel makes every variable a
+   *  CREDENTIAL: it is declared as a `stdio_env` method and the user is asked
+   *  to type its value on a masked form. That is right for an API key and
+   *  wrong for a machine-derived path — a Codex plugin's `CODEX_HOME` is
+   *  already known to the scanner, is not a secret, and must never become a
+   *  field a person has to fill in. Nothing here is a credential, so it does
+   *  not appear in `authenticationTemplate`. */
+  staticEnv: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   cwd: Schema.optional(Schema.String),
   /** Protocol negotiation at connect: `auto` probes `server/discover` (spec
    *  2026-07-28) for modern-only servers. Defaults to the legacy `initialize`
    *  handshake — the right call for spawn-per-call servers, where the auto
    *  probe costs an extra child process per connect. */
   versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
+  /** Opt out of process reuse — spawn a fresh child for every tool call (see
+   *  `McpStdioIntegrationConfig.spawnPerCall`). */
+  spawnPerCall: Schema.optional(Schema.Boolean),
+  /** Reach the server through the Codex app-server bridge: the command spawns
+   *  `codex app-server` and `server` names the MCP server inside Codex whose
+   *  tools this integration exposes. Set by the Codex plugin add flow. */
+  appServer: Schema.optional(
+    Schema.Struct({
+      server: Schema.String,
+      surface: Schema.optional(Schema.Literals(["sky", "browser"])),
+      modulePath: Schema.optional(Schema.String),
+      presetId: Schema.optional(Schema.String),
+    }),
+  ),
   slug: Schema.optional(Schema.String),
 });
 
@@ -280,6 +311,10 @@ const McpProbeEndpointOutputSchema = Schema.Struct({
   /** The server's `instructions` from initialize — prefill for the add form's
    *  description. Only available when the probe connected unauthenticated. */
   instructions: Schema.NullOr(Schema.String),
+  /** Present when discovery succeeded: which protocol negotiation worked.
+   *  `legacy` means the server echoed the modern revision and then broke its
+   *  contract — the add should pin `versionNegotiation: "legacy"`. */
+  versionNegotiation: Schema.optional(McpStdioVersionNegotiation),
 });
 
 // ---------------------------------------------------------------------------
@@ -383,6 +418,40 @@ const normalizeSlug = (input: McpServerInput): string =>
 /** Slug for a stdio server's secret-env auth method (one per integration). */
 const STDIO_ENV_TEMPLATE = "env";
 
+/** Recover the inline credentials carried by a pre-auth-revamp stdio config.
+ *  A non-null result is the single predicate shared by catalog projection and
+ *  reconciliation: those values must never be mistaken for static env. */
+const legacyStdioInlineCredentials = (
+  config: McpStdioIntegrationConfig,
+): {
+  readonly values: Readonly<Record<string, string>>;
+  readonly vars: readonly string[];
+} | null => {
+  const values = config.env ?? {};
+  const vars = Object.keys(values);
+  return vars.length > 0 ? { values, vars } : null;
+};
+
+/** Project the auth methods a stored MCP config truthfully exposes. Legacy
+ *  stdio rows carried credentials inline and had no declared method, so both
+ *  catalog validation and runtime rendering must see the same synthetic
+ *  method until reconciliation canonicalizes the row. */
+const projectedMcpAuthMethods = (config: McpIntegrationConfigType): readonly McpAuthMethod[] => {
+  if (config.transport === "stdio" && config.authenticationTemplate === undefined) {
+    const credentials = legacyStdioInlineCredentials(config);
+    return credentials === null
+      ? [{ slug: "none", kind: "none" }]
+      : [
+          {
+            slug: STDIO_ENV_TEMPLATE,
+            kind: "stdio_env",
+            vars: credentials.vars,
+          },
+        ];
+  }
+  return config.authenticationTemplate ?? [];
+};
+
 /** The secret env var NAMES a stdio add declares: the explicit `envVars`
  *  declaration plus the keys of any one-shot `env` values, de-duplicated and
  *  order-preserving. */
@@ -392,20 +461,27 @@ const stdioEnvVarNames = (input: McpStdioServerInput): readonly string[] => {
   return [...names];
 };
 
-const toIntegrationConfig = (input: McpServerInput): McpIntegrationConfigType => {
+/** Exported for tests: the credential/non-credential split is a security
+ *  boundary (a value in `env` becomes something the user is asked to type),
+ *  and asserting it through the whole add flow would not show it. */
+export const toIntegrationConfig = (input: McpServerInput): McpIntegrationConfigType => {
   if (input.transport === "stdio") {
     // The config only DECLARES the secret env vars by NAME (a `stdio_env`
     // method); their values are credentials and live on the connection, never
     // in this blob. Names come from the explicit `envVars` declaration and/or
     // the keys of any one-shot `env` values.
     const vars = stdioEnvVarNames(input);
+    const staticEnv = input.staticEnv;
     return {
       transport: "stdio",
       family: input.family?.trim() || undefined,
       command: input.command,
       args: input.args ? [...input.args] : undefined,
+      env: staticEnv !== undefined && Object.keys(staticEnv).length > 0 ? staticEnv : undefined,
       cwd: input.cwd,
       versionNegotiation: input.versionNegotiation,
+      spawnPerCall: input.spawnPerCall,
+      appServer: input.appServer,
       authenticationTemplate:
         vars.length > 0
           ? [{ slug: STDIO_ENV_TEMPLATE, kind: "stdio_env", vars }]
@@ -422,6 +498,7 @@ const toIntegrationConfig = (input: McpServerInput): McpIntegrationConfigType =>
     authenticationTemplate: input.authenticationTemplate
       ? normalizeMcpAuthMethods(input.authenticationTemplate)
       : [mcpAuthMethodFromShorthand(input.auth ?? { kind: "none" })],
+    versionNegotiation: input.versionNegotiation,
   };
 };
 
@@ -589,7 +666,7 @@ const selectAuthMethod = (
   config: McpIntegrationConfigType,
   templateSlug: string | null,
 ): McpAuthMethod | undefined => {
-  const methods = config.authenticationTemplate ?? [];
+  const methods = projectedMcpAuthMethods(config);
   if (templateSlug !== null) {
     const match = methods.find((method: McpAuthMethod) => method.slug === templateSlug);
     if (match) return match;
@@ -633,6 +710,8 @@ const buildConnectorInput = (
       env: Object.keys(env).length > 0 ? env : undefined,
       cwd: config.cwd,
       versionNegotiation: config.versionNegotiation,
+      spawnPerCall: config.spawnPerCall,
+      appServer: config.appServer,
     } satisfies McpStdioIntegrationConfig);
   }
 
@@ -661,6 +740,7 @@ const buildConnectorInput = (
     authProvider,
     ...(authProvider === undefined ? {} : { staticOAuthBearer: true }),
     httpClientLayer,
+    versionNegotiation: config.versionNegotiation,
   });
 };
 
@@ -699,21 +779,71 @@ const sortedRecord = (
  *  Exported for tests (not re-exported from `sdk/index.ts`, so this widens no
  *  public API): the retention property is a property of the KEY, and asserting
  *  it through pool behaviour alone would not see it. */
+/** The connector inputs the pool accepts.
+ *
+ *  Remote servers, app-server bridge connections, and plain stdio servers
+ *  that have not opted out via `spawnPerCall`. Pooling the bridge is what
+ *  makes a Codex plugin's "for this conversation" approval mean anything:
+ *  that grant lives on the Codex THREAD, and the bridge starts one thread per
+ *  connection, so a connection per call re-asked on every call. Plain stdio
+ *  is pooled for latency: a spawn-per-call server pays the child spawn plus a
+ *  full MCP handshake on EVERY tool call (~1s for an `npx`-launched server),
+ *  which is how every other MCP client avoids it — they keep the child alive
+ *  for the whole session. A server that genuinely depends on fresh-process
+ *  semantics sets `spawnPerCall: true` in its stdio config. The bridge
+ *  ignores that flag: its approvals are session state, so it must pool. */
+export type PoolableConnectorInput =
+  | Extract<ConnectorInput, { readonly transport: "remote" }>
+  | McpStdioIntegrationConfig;
+
+/** Whether this connection may be retained between calls (see
+ *  `PoolableConnectorInput`). */
+export const isPoolableConnectorInput = (input: ConnectorInput): input is PoolableConnectorInput =>
+  input.transport === "remote" || input.appServer !== undefined || input.spawnPerCall !== true;
+
 export const connectionPoolKey = (
-  input: Extract<ConnectorInput, { readonly transport: "remote" }>,
+  input: PoolableConnectorInput,
   template: string,
   values: Record<string, string | null>,
+  /** The connection this lease belongs to. Part of the identity, not a
+   *  detail: an app-server session accumulates the user's approvals ("for
+   *  this conversation"), and a no-credential integration hashes to the same
+   *  key for every connection without it — so two owners would share one
+   *  session, and one owner's approval would answer the other's prompt. */
+  identity: { readonly owner: string; readonly connection: string },
 ): Effect.Effect<string> =>
   sha256Hex(
-    JSON.stringify({
-      endpoint: input.endpoint,
-      transport: input.transport,
-      remoteTransport: input.remoteTransport,
-      headers: sortedRecord(input.headers),
-      queryParams: sortedRecord(input.queryParams),
-      template,
-      values: sortedRecord(values),
-    }),
+    JSON.stringify(
+      input.transport === "remote"
+        ? {
+            owner: identity.owner,
+            connection: identity.connection,
+            endpoint: input.endpoint,
+            transport: input.transport,
+            remoteTransport: input.remoteTransport,
+            headers: sortedRecord(input.headers),
+            queryParams: sortedRecord(input.queryParams),
+            template,
+            values: sortedRecord(values),
+          }
+        : {
+            owner: identity.owner,
+            connection: identity.connection,
+            transport: input.appServer !== undefined ? "appserver" : "stdio",
+            command: input.command,
+            args: input.args ?? [],
+            cwd: input.cwd ?? null,
+            env: sortedRecord(input.env),
+            // Plain stdio negotiates the protocol at connect, so two configs
+            // that handshake differently must never share a parked session.
+            versionNegotiation: input.versionNegotiation ?? null,
+            server: input.appServer?.server ?? null,
+            surface: input.appServer?.surface ?? null,
+            modulePath: input.appServer?.modulePath ?? null,
+            template,
+            values: sortedRecord(values),
+          },
+    ),
   );
 
 // ---------------------------------------------------------------------------
@@ -751,9 +881,9 @@ export const describeMcpAuthMethods = (
   if (!config) return [];
 
   // Stdio servers declare a single `stdio_env` method (or `none`); remote
-  // servers declare header/query/oauth methods. Both project from the same
-  // optional `authenticationTemplate`.
-  const methods = config.authenticationTemplate ?? [];
+  // servers declare header/query/oauth methods. Runtime method selection uses
+  // this same truthful projection, including synthetic legacy stdio methods.
+  const methods = projectedMcpAuthMethods(config);
   return methods.map((method: McpAuthMethod): AuthMethodDescriptor => {
     if (method.kind === "stdio_env") return describeStdioEnvAuthMethod(method);
     if (method.kind === "apikey") return describeApiKeyAuthMethod(method);
@@ -825,7 +955,10 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
     ...("url" in preset && preset.url ? { url: preset.url } : {}),
     ...("endpoint" in preset && preset.endpoint ? { endpoint: preset.endpoint } : {}),
     ...(preset.icon ? { icon: preset.icon } : {}),
+    ...(preset.fallbackIcon ? { fallbackIcon: preset.fallbackIcon } : {}),
     ...(preset.featured ? { featured: preset.featured } : {}),
+    ...(preset.family ? { family: preset.family } : {}),
+    ...("defaultSlug" in preset && preset.defaultSlug ? { defaultSlug: preset.defaultSlug } : {}),
     transport: ("transport" in preset && preset.transport === "stdio" ? "stdio" : "remote") as
       | "stdio"
       | "remote",
@@ -870,17 +1003,17 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           const probeHeaders = typeof input === "string" ? undefined : input.headers;
           const probeQueryParams = typeof input === "string" ? undefined : input.queryParams;
 
-          const connector = createMcpConnector({
+          const result = yield* discoverToolsFromInput({
             transport: "remote",
             endpoint: trimmed,
             headers: probeHeaders,
             queryParams: probeQueryParams,
             httpClientLayer,
-          });
-
-          const result = yield* discoverTools(connector).pipe(
-            Effect.map((m) => ({ ok: true as const, manifest: m })),
-            Effect.catch(() => Effect.succeed({ ok: false as const, manifest: null })),
+          }).pipe(
+            Effect.map((d) => ({ ok: true as const, ...d })),
+            Effect.catch(() =>
+              Effect.succeed({ ok: false as const, manifest: null, versionNegotiation: null }),
+            ),
             Effect.withSpan("mcp.plugin.discover_tools"),
           );
 
@@ -895,6 +1028,9 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
               toolCount: result.manifest.tools.length,
               serverName: result.manifest.server?.name ?? null,
               instructions: result.manifest.server?.instructions ?? null,
+              ...(result.versionNegotiation === "legacy"
+                ? { versionNegotiation: "legacy" as const }
+                : {}),
             } satisfies McpProbeResult;
           }
 
@@ -1119,16 +1255,14 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
               });
               if (connections.length > 0) return; // already connectable — nothing to heal.
 
-              const inlineEnv = config.env ?? {};
-              const envVars = Object.keys(inlineEnv);
-              const hasEnv = envVars.length > 0;
+              const credentials = legacyStdioInlineCredentials(config);
 
               yield* ctx.connections.create({
                 owner: "org",
                 name: ConnectionName.make("default"),
                 integration: integration.slug,
-                template: AuthTemplateSlug.make(hasEnv ? STDIO_ENV_TEMPLATE : "none"),
-                values: hasEnv ? { ...inlineEnv } : {},
+                template: AuthTemplateSlug.make(credentials === null ? "none" : STDIO_ENV_TEMPLATE),
+                values: credentials === null ? {} : { ...credentials.values },
               });
 
               // The secret is now on the connection: canonicalize this legacy
@@ -1140,9 +1274,16 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
                 args: config.args,
                 cwd: config.cwd,
                 versionNegotiation: config.versionNegotiation,
-                authenticationTemplate: hasEnv
-                  ? [{ slug: STDIO_ENV_TEMPLATE, kind: "stdio_env", vars: envVars }]
-                  : [{ slug: "none", kind: "none" }],
+                authenticationTemplate:
+                  credentials === null
+                    ? [{ slug: "none", kind: "none" }]
+                    : [
+                        {
+                          slug: STDIO_ENV_TEMPLATE,
+                          kind: "stdio_env",
+                          vars: credentials.vars,
+                        },
+                      ],
               };
               yield* ctx.core.integrations.update(integration.slug, { config: nextConfig });
             }).pipe(
@@ -1286,6 +1427,120 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           }),
         );
 
+      // Discover locally installed Codex plugins with stdio MCP servers. The
+      // scanner touches node:fs, so it stays behind a dynamic import (the
+      // stdio-connector pattern) and behind the stdio gate: with stdio off the
+      // presets could not be added anyway.
+      /** How long the probe waits for the plugin to answer. Deliberately
+       *  under the MCP SDK's 60s default: a pending macOS consent prompt
+       *  blocks the call indefinitely, and the person should be told to look
+       *  for the prompt rather than watch "Checking…" for a minute. */
+      const PROBE_ANSWER_TIMEOUT_MS = 25_000;
+      /** The client SDK signals its request timeout as an `SdkError` with
+       *  code `REQUEST_TIMEOUT`. Matched structurally: the SDK is loaded
+       *  dynamically, so its error class is not importable here. */
+      const isMcpRequestTimeout = (cause: unknown): boolean =>
+        typeof cause === "object" &&
+        cause !== null &&
+        "code" in cause &&
+        (cause as { readonly code: unknown }).code === "REQUEST_TIMEOUT";
+
+      /** Ask a Codex plugin whether macOS will actually let it work.
+       *
+       *  Runs the plugin's own read-only probe tool down the REAL path — the
+       *  same bridge, spawn, and service a live call uses — because that is
+       *  the only honest answer available. macOS exposes no way to read
+       *  another app's privacy decisions, and the grants here are split across
+       *  two identities (the host holds Automation; the Codex service holds
+       *  the rest), so nothing short of trying it can tell the user where they
+       *  stand. A denial is reported as the grant to enable.
+       *
+       *  Safe to run on demand: every probe tool is a listing or a status
+       *  read. If macOS has not yet asked, this is what makes it ask. */
+      const checkCodexPluginAccess = (id: string) =>
+        Effect.gen(function* () {
+          if (!allowStdio) return { status: "unsupported" as const };
+          const plugins = yield* listCodexPlugins();
+          const plugin = plugins.find((entry) => entry.id === id);
+          if (plugin === undefined) return { status: "unknown" as const };
+          if (!plugin.available) return { status: "not-installed" as const };
+
+          const mod = yield* Effect.promise(() => import("./codex-plugin-presets"));
+          const preset = mod.CURATED_CODEX_PLUGINS.find((entry) => entry.id === id);
+          const probe = preset?.probeTool;
+          if (probe === undefined) return { status: "nothing-to-check" as const };
+
+          const connector = createMcpConnector({
+            transport: "stdio",
+            command: plugin.command,
+            args: plugin.args,
+            env: plugin.env === undefined ? undefined : { ...plugin.env },
+            ...(plugin.appServer === undefined ? {} : { appServer: plugin.appServer }),
+          });
+
+          // A probe that hangs is a real outcome, not an edge case: an Apple
+          // Event blocks for as long as macOS sits on the consent decision.
+          // Under the SDK's 60s default the card shows "Checking…" for a full
+          // minute and then misreports the hang as a failed start.
+          let timedOut = false;
+          return yield* Effect.gen(function* () {
+            const connection = yield* connector;
+            const result = yield* Effect.tryPromise({
+              try: () =>
+                connection.client.callTool(
+                  { name: probe.name, arguments: probe.args },
+                  { timeout: PROBE_ANSWER_TIMEOUT_MS },
+                ),
+              catch: (cause) => {
+                timedOut = isMcpRequestTimeout(cause);
+                return new McpConnectionError({
+                  transport: "appserver",
+                  message: "The plugin did not answer.",
+                });
+              },
+            }).pipe(Effect.ensuring(Effect.promise(() => connection.close())));
+
+            const text = (Array.isArray(result.content) ? result.content : [])
+              .map((block) => (block as { readonly text?: unknown }).text)
+              .filter((value): value is string => typeof value === "string")
+              .join(" ");
+            if (result.isError === true) {
+              return { status: "blocked" as const, message: text };
+            }
+            return { status: "ok" as const };
+          }).pipe(
+            // Any failure to even reach the plugin is reported the same way a
+            // refusal is: the user cares that it does not work and why, not
+            // which layer said no.
+            // Distinguish the two ways this can fail by TAG, not by reading a
+            // message off an unknown: the plugin refused, or we never reached
+            // it at all.
+            Effect.catchTags({
+              McpConnectionError: () =>
+                Effect.succeed({
+                  status: "blocked" as const,
+                  message: timedOut
+                    ? "macOS has not answered yet. If a permission prompt is on screen, answer it, then check again."
+                    : "Could not start the plugin. Check that Codex is installed and signed in.",
+                }),
+              McpOAuthReauthorizationRequired: () =>
+                Effect.succeed({
+                  status: "blocked" as const,
+                  message: "The plugin needs to be re-authorized in Codex.",
+                }),
+            }),
+            Effect.withSpan("mcp.plugin.check_codex_plugin_access"),
+          );
+        });
+
+      const listCodexPlugins = () =>
+        allowStdio
+          ? Effect.promise(() => import("./codex-plugins")).pipe(
+              Effect.map((mod) => mod.scanCodexPlugins()),
+              Effect.withSpan("mcp.plugin.list_codex_plugins"),
+            )
+          : Effect.succeed([] as readonly CodexPluginEntry[]);
+
       return {
         probeEndpoint,
         addServer,
@@ -1294,6 +1549,8 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
         getServer,
         configureServer,
         configureAuth,
+        listCodexPlugins,
+        checkCodexPluginAccess,
       };
     },
 
@@ -1324,10 +1581,7 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           template === null ? null : String(template),
           allowStdio,
           httpClientLayer,
-        ).pipe(
-          Effect.map((ci) => createMcpConnector(ci)),
-          Effect.result,
-        );
+        ).pipe(Effect.result);
 
         if (Result.isFailure(built)) {
           return {
@@ -1337,7 +1591,7 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           };
         }
 
-        const discovered = yield* discoverTools(built.success).pipe(
+        const discovered = yield* discoverToolsFromInput(built.success).pipe(
           Effect.result,
           Effect.withSpan("mcp.plugin.discover_tools", {
             attributes: { "mcp.connection.name": String(connection.name) },
@@ -1360,7 +1614,7 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
               : {}),
           };
         }
-        return { tools: discovered.success.tools.map(toToolDef) };
+        return { tools: discovered.success.manifest.tools.map(toToolDef) };
       }).pipe(
         Effect.withSpan("mcp.plugin.resolve_tools", {
           attributes: { "mcp.connection.name": String(connection.name) },
@@ -1424,14 +1678,17 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           invokeHttpClientLayer,
         );
         const connector: McpConnector = createMcpConnector(connectorInput);
-        const poolKey =
-          connectorInput.transport === "remote"
-            ? yield* connectionPoolKey(
-                connectorInput,
-                String(credential.template),
-                credential.values,
-              )
-            : undefined;
+        const poolKey = isPoolableConnectorInput(connectorInput)
+          ? yield* connectionPoolKey(
+              connectorInput,
+              String(credential.template),
+              credential.values,
+              {
+                owner: String(credential.owner),
+                connection: String(credential.connection),
+              },
+            )
+          : undefined;
 
         const connectionRef = {
           owner: credential.owner,
@@ -1548,6 +1805,35 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
               })
               .pipe(Effect.ignore, Effect.as(unknownToolFailure(String(toolRow.name), credential)));
           }
+          // The server refused the call itself (typically -32602 invalid
+          // params: an argument outside the schema's enum, a missing required
+          // field). That is an expected tool failure the caller can act on —
+          // it needs the server's message to fix the arguments — not a
+          // dispatch defect to scrub into an opaque correlation id.
+          if (error.protocolError !== undefined) {
+            return Effect.succeed(
+              ToolResult.fail({
+                code: "mcp_tool_error",
+                message: error.protocolError.message,
+                retryable: false,
+                details: { jsonrpc: { code: error.protocolError.code } },
+              }),
+            );
+          }
+          // Same refusal, delivered at the HTTP layer: a 4xx with a JSON
+          // body naming the problem (Stripe answers a missing account context
+          // with a 422). The message is the server's answer to the caller.
+          if (error.httpRefusal !== undefined) {
+            return Effect.succeed(
+              ToolResult.fail({
+                code: "mcp_tool_error",
+                message: error.httpRefusal.message,
+                status: error.httpRefusal.status,
+                retryable: false,
+                details: { upstream: { status: error.httpRefusal.status } },
+              }),
+            );
+          }
           return Effect.fail(error);
         }),
         Effect.withSpan("mcp.plugin.invoke_tool", {
@@ -1573,13 +1859,11 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
         const name = parsed.value.hostname || "mcp";
         const slug = deriveMcpNamespace({ endpoint: trimmed });
 
-        const connector = createMcpConnector({
+        const connected = yield* discoverToolsFromInput({
           transport: "remote",
           endpoint: trimmed,
           httpClientLayer,
-        });
-
-        const connected = yield* discoverTools(connector).pipe(
+        }).pipe(
           Effect.map(() => true),
           Effect.catch(() => Effect.succeed(false)),
           Effect.withSpan("mcp.plugin.discover_tools"),
@@ -1691,9 +1975,9 @@ export const mcpPlugin = definePlugin((options?: McpPluginOptions) => {
           credential.template === null ? null : String(credential.template),
           allowStdio,
           options?.httpClientLayer ?? ctx.httpClientLayer,
-        ).pipe(Effect.map((ci) => createMcpConnector(ci)));
+        );
 
-        return yield* discoverTools(connector).pipe(
+        return yield* discoverToolsFromInput(connector).pipe(
           Effect.map(
             () =>
               ({ status: "healthy" as const, checkedAt: Date.now() }) satisfies HealthCheckResult,
@@ -1834,12 +2118,17 @@ export interface McpPluginExtension {
     input: McpServerInput,
   ) => Effect.Effect<
     { readonly slug: string },
-    McpExtensionFailure | IntegrationAlreadyExistsError
+    McpExtensionFailure | IntegrationAlreadyExistsError | OrgWriteDeniedError
   >;
-  readonly removeServer: (slug: string) => Effect.Effect<void, McpExtensionFailure>;
+  readonly removeServer: (
+    slug: string,
+  ) => Effect.Effect<void, McpExtensionFailure | OrgWriteDeniedError>;
   /** Ensure every stdio integration has its default connection (migrating any
    *  legacy inline env into the secret store). Idempotent; safe to run at boot. */
-  readonly reconcileStdioConnections: () => Effect.Effect<void, McpExtensionFailure>;
+  readonly reconcileStdioConnections: () => Effect.Effect<
+    void,
+    McpExtensionFailure | OrgWriteDeniedError
+  >;
   readonly getServer: (
     slug: string,
   ) => Effect.Effect<
@@ -1849,9 +2138,25 @@ export interface McpPluginExtension {
   readonly configureServer: (
     slug: string,
     config: McpIntegrationConfigType,
-  ) => Effect.Effect<void, McpExtensionFailure>;
+  ) => Effect.Effect<void, McpExtensionFailure | OrgWriteDeniedError>;
   readonly configureAuth: (
     slug: string,
     input: McpConfigureAuthInput,
-  ) => Effect.Effect<readonly McpAuthMethod[], McpExtensionFailure>;
+  ) => Effect.Effect<readonly McpAuthMethod[], McpExtensionFailure | OrgWriteDeniedError>;
+  /** Locally installed Codex plugins with stdio MCP servers, as one-click
+   *  presets. Empty when stdio is disabled. */
+  readonly listCodexPlugins: () => Effect.Effect<readonly CodexPluginEntry[], never>;
+  readonly checkCodexPluginAccess: (id: string) => Effect.Effect<
+    {
+      readonly status:
+        | "ok"
+        | "blocked"
+        | "not-installed"
+        | "nothing-to-check"
+        | "unknown"
+        | "unsupported";
+      readonly message?: string;
+    },
+    never
+  >;
 }

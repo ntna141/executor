@@ -559,6 +559,41 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
       );
     }
 
+    // The Codex app-server bridge: same spawn mechanics, but the child is
+    // `codex app-server` and an in-process adapter translates MCP to the
+    // app-server protocol (see appserver-connector.ts for why direct spawns
+    // of the curated Codex plugins cannot serve tool calls any more). The
+    // bridge answers the MCP handshake itself, so `versionNegotiation` does
+    // not apply on this path.
+    if (input.appServer !== undefined) {
+      const { server, surface, modulePath, presetId } = input.appServer;
+      return Effect.gen(function* () {
+        const { createAppServerTransport } = yield* Effect.tryPromise({
+          try: () => import("./appserver-connector"),
+          catch: () =>
+            new McpConnectionError({
+              transport: "appserver",
+              message: "Failed to load the Codex app-server bridge module",
+            }),
+        });
+
+        return yield* connectClient({
+          transport: "appserver",
+          createTransport: () =>
+            createAppServerTransport({
+              command,
+              args: input.args,
+              env: input.env,
+              cwd: input.cwd?.trim().length ? input.cwd.trim() : undefined,
+              server,
+              ...(surface === undefined ? {} : { surface }),
+              ...(modulePath === undefined ? {} : { modulePath }),
+              ...(presetId === undefined ? {} : { presetId }),
+            }),
+        });
+      });
+    }
+
     return Effect.gen(function* () {
       // Dynamic import so the underlying module (which evaluates
       // `node:child_process`) is only loaded when stdio is actually used.
@@ -600,13 +635,14 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
 
   const endpoint = buildEndpointUrl(input.endpoint, input.queryParams ?? {});
 
-  // Auto-negotiate the 2026-07-28 era unconditionally only on Streamable
-  // HTTP. SSE is a legacy-only transport; stdio negotiates per the
-  // integration's `versionNegotiation` (default legacy — see the stdio
-  // branch above).
+  // Auto-negotiate the 2026-07-28 era on Streamable HTTP unless the config
+  // pins `legacy` (for servers that echo the proposed revision and then
+  // violate its contract). SSE is a legacy-only transport; stdio negotiates
+  // per the integration's `versionNegotiation` (default legacy — see the
+  // stdio branch above).
   const connectStreamableHttp = connectClient({
     transport: "streamable-http",
-    versionNegotiation: { mode: "auto" },
+    ...(input.versionNegotiation === "legacy" ? {} : { versionNegotiation: { mode: "auto" } }),
     createTransport: (sdk) =>
       new sdk.client.StreamableHTTPClientTransport(endpoint, {
         requestInit,

@@ -19,7 +19,7 @@
 import { Data, Effect, Option, Predicate, Schema } from "effect";
 import * as oauth from "oauth4webapi";
 
-import type { SubjectTokenType } from "./oauth-client";
+import type { SubjectTokenType, TokenEndpointAuthMethod } from "./oauth-client";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -112,6 +112,16 @@ export const OAUTH2_REFRESH_SKEW_MS = 60_000;
 
 /** Default token-endpoint timeout. */
 export const OAUTH2_DEFAULT_TIMEOUT_MS = 20_000;
+
+/** HubSpot scopes that the registered app may grant but must receive through
+ *  HubSpot's non-standard `optional_scope` authorize parameter. Keeping these
+ *  out of the RFC `scope` parameter lets accounts without the corresponding
+ *  product features complete consent while still granting them when present. */
+export const HUBSPOT_OPTIONAL_SCOPES = [
+  "content",
+  "crm.objects.custom.read",
+  "crm.schemas.custom.read",
+] as const;
 
 /** RFC 8693 §2.1 token-exchange grant. */
 export const TOKEN_EXCHANGE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -247,7 +257,12 @@ export const buildAuthorizationUrl = (input: BuildAuthorizationUrlInput): string
  *  re-consent can silently keep the old scope set. Do not add
  *  `include_granted_scopes=true` here: with historical grants on the same Google
  *  consent app, Google folds those unrelated scopes into the new consent flow and
- *  can fail inside accounts.google.com before returning to our callback. */
+ *  can fail inside accounts.google.com before returning to our callback.
+ *
+ *  HubSpot: app scopes marked optional are ignored when they are omitted from
+ *  the provider-specific `optional_scope` parameter. The OpenAPI auth template
+ *  can only declare RFC scopes, so this host-level quirk must apply to both
+ *  first-party and workspace-owned HubSpot OAuth clients. */
 export const providerAuthorizeExtras = (
   authorizationUrl: string,
 ): Readonly<Record<string, string>> => {
@@ -257,10 +272,28 @@ export const providerAuthorizeExtras = (
     if (host === "accounts.google.com") {
       return { access_type: "offline", prompt: "consent" };
     }
+    if (host === "app.hubspot.com") {
+      return { optional_scope: HUBSPOT_OPTIONAL_SCOPES.join(" ") };
+    }
   } catch {
     // Unparseable authorization URL — let buildAuthorizationUrl surface the error.
   }
   return {};
+};
+
+/** Provider-specific scopes embedded in an integration's authorization
+ *  endpoint. HubSpot models app-optional permissions with the non-standard
+ *  `optional_scope` query parameter, so they are part of the integration's
+ *  request contract rather than the registered OAuth app identity. */
+export const optionalScopesFromAuthorizationUrl = (authorizationUrl: string): readonly string[] => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: URL() throws on invalid input -> no optional scopes
+  try {
+    const value = new URL(authorizationUrl).searchParams.get("optional_scope");
+    if (value == null) return [];
+    return [...new Set(value.split(/\s+/).filter(Boolean))];
+  } catch {
+    return [];
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -842,7 +875,7 @@ const hostnameForTelemetry = (url: string): string => URL.parse(url)?.hostname ?
 // oauth4webapi adapter helpers
 // ---------------------------------------------------------------------------
 
-export type ClientAuthMethod = "body" | "basic";
+export type ClientAuthMethod = TokenEndpointAuthMethod;
 
 /**
  * The token-endpoint client-auth transport used when a caller doesn't specify
@@ -850,8 +883,10 @@ export type ClientAuthMethod = "body" | "basic";
  * method our DCR registers (`token_endpoint_auth_method: client_secret_post`)
  * and the one every confidential client in the v2 model uses. EXPLICIT and
  * documented rather than a hidden inline `?? "body"`: callers that need
- * `client_secret_basic` pass `clientAuth: "basic"`. For PUBLIC clients (no
- * secret) the method is irrelevant — `pickClientAuth` returns `None()`.
+ * `client_secret_basic` pass `clientAuth: "basic"`. Providers that reject the
+ * RFC form encoding can explicitly pass `clientAuth: "basic_raw"`. For PUBLIC
+ * clients (no secret) the method is irrelevant — `pickClientAuth` returns
+ * `None()`.
  */
 export const DEFAULT_CLIENT_AUTH_METHOD: ClientAuthMethod = "body";
 
@@ -914,15 +949,29 @@ const oauth4webapiRequestOptions = (
 // (public PKCE — `None()`, RFC 7636). This is not a silent guess: `loadClient`
 // persists a non-empty secret for confidential clients and null/"" for public
 // ones, so an absent secret here unambiguously means "public client". The
-// `method` only chooses HOW a present secret is sent (post vs basic).
+// `method` only chooses HOW a present secret is sent (post vs either Basic
+// credential encoding).
+const base64BasicCredentials = (clientId: string, clientSecret: string): string => {
+  const bytes = new TextEncoder().encode(`${clientId}:${clientSecret}`);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return globalThis.btoa(binary);
+};
+
+const rawClientSecretBasic =
+  (clientSecret: string): oauth.ClientAuth =>
+  (_authorizationServer, client, _body, headers) => {
+    headers.set("authorization", `Basic ${base64BasicCredentials(client.client_id, clientSecret)}`);
+  };
+
 const pickClientAuth = (
   clientSecret: string | null | undefined,
   method: ClientAuthMethod,
 ): oauth.ClientAuth => {
   if (!clientSecret) return oauth.None();
-  return method === "basic"
-    ? oauth.ClientSecretBasic(clientSecret)
-    : oauth.ClientSecretPost(clientSecret);
+  if (method === "basic") return oauth.ClientSecretBasic(clientSecret);
+  if (method === "basic_raw") return rawClientSecretBasic(clientSecret);
+  return oauth.ClientSecretPost(clientSecret);
 };
 
 const normalizedTokenScope = (
@@ -1122,13 +1171,6 @@ export type ExchangeAuthorizationCodeInput = {
   readonly fetch?: typeof globalThis.fetch;
 };
 
-const base64BasicCredentials = (clientId: string, clientSecret: string): string => {
-  const bytes = new TextEncoder().encode(`${clientId}:${clientSecret}`);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return globalThis.btoa(binary);
-};
-
 const jsonTokenEndpointRequest = async (input: {
   readonly tokenUrl: string;
   readonly clientId: string;
@@ -1149,21 +1191,24 @@ const jsonTokenEndpointRequest = async (input: {
     accept: "application/json",
     "content-type": "application/json",
   });
-  const confidential = Boolean(input.clientSecret);
-  if (confidential && input.clientAuth === "basic") {
-    headers.set(
-      "authorization",
-      `Basic ${base64BasicCredentials(input.clientId, input.clientSecret ?? "")}`,
+  const clientSecret = input.clientSecret ?? "";
+  const confidential = clientSecret.length > 0;
+  if (confidential && input.clientAuth !== "body") {
+    await pickClientAuth(clientSecret, input.clientAuth)(
+      asFromTokenUrl(tokenUrl, input.endpointUrlPolicy),
+      { client_id: input.clientId },
+      new URLSearchParams(),
+      headers,
     );
   }
   const body = {
     grant_type: input.grantType,
     ...input.parameters,
-    ...(confidential && input.clientAuth === "basic"
+    ...(confidential && input.clientAuth !== "body"
       ? {}
       : {
           client_id: input.clientId,
-          ...(confidential ? { client_secret: input.clientSecret ?? "" } : {}),
+          ...(confidential ? { client_secret: clientSecret } : {}),
         }),
   };
   // oxlint-disable-next-line executor/no-raw-fetch -- boundary: provider token exchange is the SDK's HTTP boundary and preserves its injected fetch seam
@@ -1332,72 +1377,102 @@ export type RefreshAccessTokenInput = {
 
 export const refreshAccessToken = (
   input: RefreshAccessTokenInput,
-): Effect.Effect<OAuth2TokenResponse, OAuth2Error> =>
-  Effect.tryPromise({
-    try: async () => {
-      const as = asFromTokenUrlAndIssuer(input.tokenUrl, input.issuerUrl, {
-        idTokenSigningAlgValuesSupported: input.idTokenSigningAlgValuesSupported,
-        endpointUrlPolicy: input.endpointUrlPolicy,
-      });
-      const client: oauth.Client = { client_id: input.clientId };
-      const clientAuth = pickClientAuth(
-        input.clientSecret,
-        input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
-      );
-      const extraParams = new URLSearchParams();
-      if (input.scopes && input.scopes.length > 0) {
-        extraParams.set("scope", input.scopes.join(input.scopeSeparator ?? " "));
-      }
-      if (input.resource) {
-        extraParams.set("resource", input.resource);
-      }
-      const additionalParameters =
-        Array.from(extraParams.keys()).length > 0 ? extraParams : undefined;
-      if (input.requestFormat === "json") {
-        const response = await jsonTokenEndpointRequest({
-          tokenUrl: input.tokenUrl,
-          clientId: input.clientId,
-          clientSecret: input.clientSecret,
-          clientAuth: input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
-          grantType: "refresh_token",
-          parameters: {
-            refresh_token: input.refreshToken,
-            ...(input.scopes && input.scopes.length > 0
-              ? { scope: input.scopes.join(input.scopeSeparator ?? " ") }
-              : {}),
-            ...(input.resource ? { resource: input.resource } : {}),
-          },
-          timeoutMs: input.timeoutMs,
+): Effect.Effect<OAuth2TokenResponse, OAuth2Error> => {
+  const requestedScopes = input.scopes && input.scopes.length > 0 ? input.scopes : undefined;
+  const scopeParameter = (scopes: readonly string[] | undefined): string | undefined =>
+    scopes === undefined ? undefined : scopes.join(input.scopeSeparator ?? " ");
+
+  const attempt = (
+    scopes: readonly string[] | undefined,
+  ): Effect.Effect<OAuth2TokenResponse, OAuth2Error> =>
+    Effect.tryPromise({
+      try: async () => {
+        const as = asFromTokenUrlAndIssuer(input.tokenUrl, input.issuerUrl, {
+          idTokenSigningAlgValuesSupported: input.idTokenSigningAlgValuesSupported,
           endpointUrlPolicy: input.endpointUrlPolicy,
-          fetch: input.fetch,
         });
-        return await processTokenEndpointResponse(as, client, response);
-      }
-      const response = await oauth.refreshTokenGrantRequest(
-        as,
-        client,
-        clientAuth,
-        input.refreshToken,
-        {
-          ...oauth4webapiRequestOptions(
-            input.tokenUrl,
-            input.timeoutMs,
-            input.endpointUrlPolicy,
-            input.fetch,
+        const client: oauth.Client = { client_id: input.clientId };
+        const clientAuth = pickClientAuth(
+          input.clientSecret,
+          input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
+        );
+        const scope = scopeParameter(scopes);
+        const extraParams = new URLSearchParams();
+        if (scope !== undefined) {
+          extraParams.set("scope", scope);
+        }
+        if (input.resource) {
+          extraParams.set("resource", input.resource);
+        }
+        const additionalParameters =
+          Array.from(extraParams.keys()).length > 0 ? extraParams : undefined;
+        if (input.requestFormat === "json") {
+          const response = await jsonTokenEndpointRequest({
+            tokenUrl: input.tokenUrl,
+            clientId: input.clientId,
+            clientSecret: input.clientSecret,
+            clientAuth: input.clientAuth ?? DEFAULT_CLIENT_AUTH_METHOD,
+            grantType: "refresh_token",
+            parameters: {
+              refresh_token: input.refreshToken,
+              ...(scope !== undefined ? { scope } : {}),
+              ...(input.resource ? { resource: input.resource } : {}),
+            },
+            timeoutMs: input.timeoutMs,
+            endpointUrlPolicy: input.endpointUrlPolicy,
+            fetch: input.fetch,
+          });
+          return await processTokenEndpointResponse(as, client, response);
+        }
+        const response = await oauth.refreshTokenGrantRequest(
+          as,
+          client,
+          clientAuth,
+          input.refreshToken,
+          {
+            ...oauth4webapiRequestOptions(
+              input.tokenUrl,
+              input.timeoutMs,
+              input.endpointUrlPolicy,
+              input.fetch,
+            ),
+            additionalParameters,
+          },
+        );
+        const result = await oauth.processRefreshTokenResponse(
+          as,
+          client,
+          (await stripIdToken(response)).response,
+        );
+        return tokenResponseFrom(as, result);
+      },
+      catch: (cause) => cause,
+    }).pipe(Effect.catch(failOAuth2WithHttpSummary(input.clientSecret)));
+
+  // RFC 6749 §6 makes echoing the grant's own scope legal and omission mean
+  // "the scope originally granted". An AS whose stored grant is narrower than
+  // the connection's record — Railway answers any scope-bearing refresh with
+  // `invalid_scope: refresh token missing requested scope` — rejects that echo,
+  // leaving a live refresh token unusable. Retry once WITHOUT `scope`, the form
+  // whose meaning does not depend on our record being right. Only
+  // `invalid_scope` qualifies: `invalid_grant` means the token is dead, and
+  // retrying that spends a rotating refresh token to learn nothing.
+  const retryWithoutScope = (): Effect.Effect<OAuth2TokenResponse, OAuth2Error> =>
+    attempt(undefined).pipe(
+      Effect.tap(() =>
+        Effect.annotateCurrentSpan({ "executor.oauth.refresh_scope_omitted": true }),
+      ),
+    );
+
+  return (
+    requestedScopes === undefined
+      ? attempt(undefined)
+      : attempt(requestedScopes).pipe(
+          Effect.catch((cause) =>
+            cause.error === "invalid_scope" ? retryWithoutScope() : Effect.fail(cause),
           ),
-          additionalParameters,
-        },
-      );
-      const result = await oauth.processRefreshTokenResponse(
-        as,
-        client,
-        (await stripIdToken(response)).response,
-      );
-      return tokenResponseFrom(as, result);
-    },
-    catch: (cause) => cause,
-  }).pipe(
-    Effect.catch(failOAuth2WithHttpSummary(input.clientSecret)),
+        )
+  ).pipe(
     withTokenRequestSpan({
       grantType: "refresh_token",
       tokenUrl: input.tokenUrl,
@@ -1405,6 +1480,7 @@ export const refreshAccessToken = (
       hasResource: input.resource !== undefined,
     }),
   );
+};
 
 // ---------------------------------------------------------------------------
 // RFC 8693 token exchange → Identity Assertion JWT Authorization Grant

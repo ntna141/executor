@@ -58,6 +58,38 @@ const oauthPlugin = definePlugin(() => ({
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
 
 describe("oauth.registerDynamicClient", () => {
+  it.effect("denies member org DCR before contacting the authorization server", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({
+          plugins,
+          orgWrites: "denied",
+        });
+
+        const error = yield* executor.oauth
+          .registerDynamicClient({
+            owner: "org",
+            slug: CLIENT,
+            issuer: server.issuerUrl,
+            registrationEndpoint: server.registrationEndpoint,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            resource: server.mcpResourceUrl,
+            scopes: ["read"],
+            tokenEndpointAuthMethodsSupported: ["none"],
+            clientName: "Denied DCR",
+            redirectUri: FLOW_REDIRECT_URI,
+            originIntegration: INTEG,
+          })
+          .pipe(Effect.flip);
+
+        expect(Predicate.isTagged("OrgWriteDeniedError")(error)).toBe(true);
+        expect(registerRequestCount(yield* server.requests)).toBe(0);
+      }),
+    ),
+  );
+
   it.effect("DCR mints + persists a public (no-secret) client that lists + connects", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -337,6 +369,39 @@ describe("oauth.registerDynamicClient", () => {
         expect(registered).not.toBe(legacySlug);
         const requests = yield* server.requests;
         expect(registerRequestCount(requests)).toBe(1);
+      }),
+    ),
+  );
+
+  it.effect("registers Vercel clients with offline_access for refresh tokens", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({
+          scopes: ["openid", "offline_access"],
+        });
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.registerDynamicClient({
+          owner: "org",
+          slug: CLIENT,
+          issuer: "https://vercel.com",
+          registrationEndpoint: server.registrationEndpoint,
+          authorizationUrl: "https://vercel.com/oauth/authorize",
+          tokenUrl: server.tokenEndpoint,
+          resource: "https://mcp.vercel.com/",
+          scopes: ["openid"],
+          tokenEndpointAuthMethodsSupported: ["none"],
+          clientName: "Executor",
+          redirectUri: FLOW_REDIRECT_URI,
+          originIntegration: INTEG,
+        });
+
+        const requests = yield* server.requests;
+        const registration = requests.find(
+          (request) => request.path === "/register" && request.method === "POST",
+        );
+        expect(registration?.body).toContain('"scope":"openid offline_access"');
       }),
     ),
   );

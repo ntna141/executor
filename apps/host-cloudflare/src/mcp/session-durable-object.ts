@@ -17,6 +17,7 @@ import {
   type McpSessionInit,
   type SessionMeta,
 } from "@executor-js/cloudflare/mcp/agent-durable-object";
+import { sessionOrgRoleMetadata } from "@executor-js/cloudflare/mcp/role-metadata";
 import {
   mcpExecutionOwnerDirectoryFromNamespace,
   type McpExecutionOwnerDirectory,
@@ -126,11 +127,13 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
       organizationId: token.organizationId,
       organizationName: this.cfConfig.organizationName,
       organizationSlug: this.cfConfig.organizationSlug,
+      ...sessionOrgRoleMetadata(token),
       userId: token.userId,
       resource: token.resource,
       elicitationMode: token.elicitationMode,
       artifactsEnabled: token.artifactsEnabled,
       searchToolsEnabled: token.searchToolsEnabled,
+      toolMode: token.toolMode,
     } satisfies SessionMeta);
   }
 
@@ -148,7 +151,7 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
         sessionMeta.userId,
         sessionMeta.organizationId,
         sessionMeta.organizationName,
-        { mcpResource: sessionMeta.resource },
+        { mcpResource: sessionMeta.resource, orgWrites: "request" },
       ).pipe(Effect.provide(makeCloudflareExecutionStackLayer(config, dbHandle)));
       // Browser elicitation mode (the base owns the approval store + the HTTP
       // approval RPCs): a gated execution pauses and returns an approvalUrl into
@@ -163,6 +166,8 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
         engine,
         artifacts: executor.artifacts,
         connections: executor.connections,
+        tools: executor.tools,
+        integrations: executor.integrations,
         // Artifacts are on by default, opt-out per connection. A session
         // persisted without a value restores to the default, same as a fresh
         // connection whose URL says nothing about `?artifacts=`.
@@ -170,6 +175,7 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
         // Per-integration search tools are off by default, opt-in per
         // connection (`?search_tools=true`). Same restore rule as artifacts.
         searchToolsEnabled: sessionMeta.searchToolsEnabled ?? false,
+        mode: sessionMeta.toolMode ?? "codemode",
         // Cold restores rebuild this server with no `initialize` to replay, so
         // the negotiated apps support comes back from storage instead.
         restoredAppsEnabled: sessionMeta.appsEnabled ?? false,

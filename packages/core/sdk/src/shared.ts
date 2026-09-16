@@ -59,6 +59,7 @@ export {
   IntegrationNotFoundError,
   IntegrationAlreadyExistsError,
   IntegrationRemovalNotAllowedError,
+  OrgWriteDeniedError,
   ConnectionAlreadyExistsError,
   ConnectionNotFoundError,
   InvalidConnectionInputError,
@@ -73,6 +74,7 @@ export {
 
 // Elicitation wire schemas.
 export {
+  ElicitationMeta,
   FormElicitation,
   UrlElicitation,
   ElicitationAction,
@@ -154,9 +156,12 @@ export {
   DEFAULT_SUBJECT_TOKEN_TYPE,
   EnterpriseManagedStartInputSchema,
   EnterpriseIdentityProviderDescriptorSchema,
+  TokenEndpointAuthMethodSchema,
   type SubjectTokenType,
   type EnterpriseManagedStartInput,
   type EnterpriseIdentityProviderDescriptor,
+  type TokenEndpointAuthMethod,
+  isTokenEndpointAuthMethod,
   type FirstPartyOAuthClientConfig,
   type OAuthGrant,
   type OAuthAuthentication,

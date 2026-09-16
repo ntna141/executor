@@ -37,6 +37,7 @@ export type {
   StorageFailure,
 } from "./fuma-runtime";
 export {
+  CredentialWriteIncompleteError,
   StorageError,
   StorageConnectionError,
   UniqueViolationError,
@@ -74,6 +75,7 @@ export {
   IntegrationNotFoundError,
   IntegrationAlreadyExistsError,
   IntegrationRemovalNotAllowedError,
+  OrgWriteDeniedError,
   ConnectionAlreadyExistsError,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
@@ -106,12 +108,11 @@ export type {
   ValidateConnectionInput,
 } from "./connection";
 export type { Tool, ToolDef, ToolListFilter, ToolAnnotations } from "./tool";
-
 // Credential providers.
 export type { CredentialProvider, ProviderEntry } from "./provider";
 
 // Public projections / detection.
-export { ToolSchemaView, IntegrationDetectionResult } from "./types";
+export { ToolSchemaView, ToolAnnotationsView, IntegrationDetectionResult } from "./types";
 
 // Health-check vocabulary (pure Schema + helpers).
 export {
@@ -221,6 +222,9 @@ export { sanitizeArtifactPreviewMarkup, ARTIFACT_PREVIEW_MARKUP_LIMIT } from "./
 
 // Elicitation.
 export {
+  ElicitationMeta,
+  ElicitationResponseMeta,
+  offeredPersistence,
   FormElicitation,
   UrlElicitation,
   ElicitationAction,
@@ -229,6 +233,7 @@ export {
   type ElicitationRequest,
   type ElicitationHandler,
   type ElicitationContext,
+  type ElicitationSource,
   type OnElicitation,
   type InvokeOptions,
 } from "./elicitation";
@@ -306,9 +311,12 @@ export {
   DEFAULT_SUBJECT_TOKEN_TYPE,
   EnterpriseManagedStartInputSchema,
   EnterpriseIdentityProviderDescriptorSchema,
+  TokenEndpointAuthMethodSchema,
   type SubjectTokenType,
   type EnterpriseManagedStartInput,
   type EnterpriseIdentityProviderDescriptor,
+  type TokenEndpointAuthMethod,
+  isTokenEndpointAuthMethod,
   firstPartyOAuthClientSlug,
   isFirstPartyOAuthClientSlug,
   type FirstPartyOAuthClientConfig,
@@ -435,6 +443,13 @@ export {
   connectionAddress,
   toolAddress,
 } from "./executor";
+export {
+  CurrentOrgWriteAccess,
+  currentOrgWriteAccess,
+  makeOrgWriteAccessState,
+  type OrgWriteAccess,
+  type OrgWriteAccessState,
+} from "./org-write-access";
 
 // CLI / runtime config.
 export {

@@ -6,10 +6,16 @@ import {
 } from "@executor-js/plugin-openapi/providers/microsoft";
 import { slackMcpUserScopes } from "@executor-js/react/lib/slack-mcp-oauth";
 import { IntegrationSlug, type FirstPartyOAuthClientConfig } from "@executor-js/sdk";
+import { HUBSPOT_OPTIONAL_SCOPES } from "@executor-js/sdk/host-internal";
+
+import { makeGoogleOAuthListing } from "../analytics/google-oauth-listing";
+import { POSTHOG_INGEST_HOST } from "../edge/passthrough";
 
 /** Cloud secret bindings that enable host-operated OAuth clients. A provider
  *  is absent unless both values in its pair are present. */
 export interface FirstPartyOAuthClientEnv {
+  readonly VITE_PUBLIC_POSTHOG_KEY?: string;
+  readonly VITE_PUBLIC_POSTHOG_HOST?: string;
   readonly FIRST_PARTY_AIRTABLE_CLIENT_ID?: string;
   readonly FIRST_PARTY_AIRTABLE_CLIENT_SECRET?: string;
   readonly FIRST_PARTY_ATLASSIAN_CLIENT_ID?: string;
@@ -147,12 +153,6 @@ const HUBSPOT_REQUIRED_SCOPES = [
   "timeline",
 ] as const;
 
-const HUBSPOT_OPTIONAL_SCOPES = [
-  "content",
-  "crm.objects.custom.read",
-  "crm.schemas.custom.read",
-] as const;
-
 const MICROSOFT_SCOPES = [
   "User.Read",
   "Calendars.ReadWrite",
@@ -286,12 +286,13 @@ export const firstPartyOAuthClientsFor = (
     authorizationUrl: "https://accounts.google.com/o/oauth2/v2/auth",
     tokenUrl: "https://oauth2.googleapis.com/token",
     allowedScopes: GOOGLE_ALLOWED_SCOPES,
-    // Withdrawn from the connect picker: no new connection is offered the
-    // Executor-owned Google app. The entry stays declared on purpose — every
-    // connection already minted against it keeps refreshing and reconnecting
-    // through it. Deleting this block, or unsetting the env vars, would strand
-    // those connections instead.
-    unlisted: true,
+    // Offer the app only to the review rollout. Resolution remains available
+    // for existing connections regardless of the current listing decision.
+    isListed: makeGoogleOAuthListing({
+      projectKey: env.VITE_PUBLIC_POSTHOG_KEY,
+      host: env.VITE_PUBLIC_POSTHOG_HOST ?? `https://${POSTHOG_INGEST_HOST}`,
+      fetch: (input, init) => globalThis.fetch(input, init),
+    }),
   }),
   ...client(env.FIRST_PARTY_HUBSPOT_CLIENT_ID, env.FIRST_PARTY_HUBSPOT_CLIENT_SECRET, {
     name: "hubspot",
@@ -327,6 +328,9 @@ export const firstPartyOAuthClientsFor = (
   }),
   ...client(env.FIRST_PARTY_SLACK_CLIENT_ID, env.FIRST_PARTY_SLACK_CLIENT_SECRET, {
     name: "slack",
+    // Slack MCP requires Marketplace approval for use outside the app's workspace.
+    // Keep the client resolvable for existing connections while withholding it.
+    unlisted: true,
     authorizationUrl: "https://slack.com/oauth/v2_user/authorize",
     tokenUrl: "https://slack.com/api/oauth.v2.user.access",
     resource: "https://mcp.slack.com",

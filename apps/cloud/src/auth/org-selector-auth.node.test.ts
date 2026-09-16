@@ -16,6 +16,19 @@ import { WorkOSClient, type WorkOSClientService } from "./workos";
 
 const createdAt = new Date("2026-01-01T00:00:00.000Z");
 
+// The mirror's account row as `ensureAccount` mints it: id only, profile
+// columns unfilled until a WorkOS user payload arrives.
+const bareAccount = (id: string) => ({
+  id,
+  email: null,
+  firstName: null,
+  lastName: null,
+  avatarUrl: null,
+  workosUpdatedAt: null,
+  lastSignInAt: null,
+  createdAt,
+});
+
 // user_session belongs to BOTH orgs; the URL selects which one a request hits.
 const MEMBER = "user_session";
 const SESSION_ORG = "org_session";
@@ -67,18 +80,24 @@ const stubUsers = Layer.succeed(UserStoreService)({
   use: (_op, fn) =>
     Effect.promise(() =>
       fn({
-        ensureAccount: async (id: string) => ({ id, createdAt }),
-        getAccount: async (id: string) => ({ id, createdAt }),
+        ensureAccount: async (id: string) => bareAccount(id),
+        getAccount: async (id: string) => bareAccount(id),
         // Slug is minted at insert now — the stub returns a slugged row.
         upsertOrganization: async (org: { id: string; name: string }) => ({
           ...org,
           slug: org.id,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         getOrganization: async (id: string) => ({
           id,
           name: `Org ${id}`,
           slug: id,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         // The URL slug maps to URL_ORG (the member's other org); any other slug
@@ -87,6 +106,9 @@ const stubUsers = Layer.succeed(UserStoreService)({
           id: slug === URL_SLUG ? URL_ORG : "org_outsider",
           name: `Org ${slug}`,
           slug,
+          backfilledAt: null,
+          deletedAt: null,
+          workosUpdatedAt: null,
           createdAt,
         }),
         deleteOrganizationCascade: async () => {},
