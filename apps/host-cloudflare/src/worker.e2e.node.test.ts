@@ -540,15 +540,13 @@ describe("cloudflare host configuration errors", () => {
     await worker?.stop();
   });
 
-  it("returns an actionable response when Cloudflare Access is not configured", async () => {
+  it("returns an actionable response when trusted JWT authentication is not configured", async () => {
     for (const path of ["/api/account/me", "/mcp"]) {
       const response = await worker.fetch(path);
 
       expect(response.status).toBe(503);
       expect(response.headers.get("cache-control")).toBe("no-store");
-      await expect(response.text()).resolves.toBe(
-        "Cloudflare Access is not configured. Set ACCESS_TEAM_DOMAIN and ACCESS_AUD before serving requests.\n",
-      );
+      await expect(response.text()).resolves.toContain("SPARK_TO_EXECUTOR_JWT_SECRET");
     }
   });
 });

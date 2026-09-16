@@ -16,6 +16,7 @@ import { env } from "cloudflare:workers";
 
 import type { CloudflareConfig } from "./config";
 import { makeCloudflarePlugins } from "./plugins";
+import { makeSparkToolsHttpClientLayer } from "./spark-tools";
 
 // ---------------------------------------------------------------------------
 // Cloudflare execution-stack seams — the same shape as self-host (QuickJS code
@@ -43,12 +44,31 @@ export const makeCloudflarePluginsProvider = (
   config: CloudflareConfig,
 ): Layer.Layer<PluginsProvider> =>
   Layer.succeed(PluginsProvider)({
-    plugins: (context) =>
-      makeCloudflarePlugins(config.secretKey, {
+    plugins: (context) => {
+      const runtimeEnv = env as { SPARK_TOOLS?: Fetcher };
+      const identity =
+        context?.accountId && context.organizationId
+          ? {
+              accountId: context.accountId,
+              organizationId: context.organizationId,
+            }
+          : undefined;
+      return makeCloudflarePlugins(config.secretKey, {
         activeToolkitSlug:
           context?.mcpResource?.kind === "toolkit" ? context.mcpResource.slug : undefined,
         allowLocalNetwork: config.allowLocalNetwork,
-      }),
+        sparkToolsOrigin: config.sparkToolsOrigin,
+        httpClientLayer: identity
+          ? makeSparkToolsHttpClientLayer({
+              binding: runtimeEnv.SPARK_TOOLS,
+              origin: config.sparkToolsOrigin,
+              secret: config.executorToSparkJwtSecret,
+              allowLocalNetwork: config.allowLocalNetwork,
+              ...identity,
+            })
+          : undefined,
+      });
+    },
   });
 
 export const makeCloudflareHostConfig = (config: CloudflareConfig): Layer.Layer<HostConfig> =>

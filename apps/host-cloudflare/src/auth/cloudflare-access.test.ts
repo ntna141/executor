@@ -4,10 +4,17 @@ import type { CloudflareConfig } from "../config";
 import { principalFromAccessClaims } from "./cloudflare-access";
 
 const config: CloudflareConfig = {
+  authMode: "access",
   accessTeamDomain: "team.cloudflareaccess.com",
   accessAud: "aud-tag",
   accessNameClaim: "name",
   accessGroupsClaim: "groups",
+  sparkToExecutorJwtSecret: "",
+  trustedJwtIssuer: "",
+  trustedJwtAudience: "",
+  trustedJwtOrganizationClaim: "org",
+  sparkToolsOrigin: "",
+  executorToSparkJwtSecret: "",
   adminEmails: ["admin@example.com"],
   organizationId: "default",
   organizationName: "Default",

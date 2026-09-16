@@ -4,8 +4,8 @@
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
   "main": "src/worker.ts",
-  // Access configuration is set per installation after the first deploy.
-  // Preserve those live bindings when this source config does not declare them.
+  // Preserve live secrets and bindings when this source config does not declare
+  // them.
   "keep_vars": true,
   "observability": { "enabled": true },
   // The web UI (Workers Static Assets) — the shared multiplayer SPA built by
@@ -29,7 +29,7 @@
     {
       "binding": "DB",
       "database_name": "executor",
-      "database_id": "ae748ca1-032c-4427-a1a0-fe39db77d1a9",
+      "database_id": "7f4f9828-bd75-4258-b86c-098069cae5ad",
     },
   ],
   // Plugin blob seam backend: multi-MB values (resolved OpenAPI specs,
@@ -50,6 +50,7 @@
       "binding": "LOADER",
     },
   ],
+  "services": [{ "binding": "SPARK_TOOLS", "service": "cloudflare-chat-agent" }],
   // The MCP session Durable Object: one addressable isolate per MCP session (the
   // DO id IS the session id) so a session survives across the Worker's stateless
   // isolates — without it, `tools/list` after `initialize` can land on a fresh
@@ -65,18 +66,24 @@
     { "tag": "v1", "new_sqlite_classes": ["McpSessionDO"] },
     { "tag": "v2", "new_sqlite_classes": ["McpExecutionOwnerDirectoryDO"] },
   ],
-  // Cloudflare Access is the entire auth layer. ACCESS_TEAM_DOMAIN, ACCESS_AUD,
-  // and ADMIN_EMAILS are installation-specific live vars, set after the first
-  // deploy and preserved by keep_vars. EXECUTOR_SECRET_KEY (the at-rest
-  // secret-encryption key) is a SECRET, set it with
-  // `wrangler secret put EXECUTOR_SECRET_KEY`, never in vars.
+  // WorkAgent uses short-lived JWTs for HTTP APIs and a persistent,
+  // conversation-bound capability for the public MCP endpoint.
+  // SPARK_TO_EXECUTOR_JWT_SECRET, EXECUTOR_TO_SPARK_JWT_SECRET, and EXECUTOR_SECRET_KEY are
+  // Wrangler secrets; never put them in this file. Access mode remains
+  // available to upstream users.
   "vars": {
+    "AUTH_MODE": "trusted-jwt",
+    "TRUSTED_JWT_ISSUER": "spark",
+    "TRUSTED_JWT_AUDIENCE": "spark-executor",
+    "TRUSTED_JWT_ORGANIZATION_CLAIM": "org",
+    "SPARK_TOOLS_ORIGIN": "https://cloudflare-chat-agent.ntna102.workers.dev",
     "ACCESS_NAME_CLAIM": "name",
     "ACCESS_GROUPS_CLAIM": "groups",
     // Never preserve a production dev-auth override through keep_vars.
     "ENABLE_DEV_AUTH": "false",
-    "SELF_HOSTED_ORG_ID": "default",
-    "SELF_HOSTED_ORG_NAME": "Default",
+    "SELF_HOSTED_ORG_ID": "spark",
+    "SELF_HOSTED_ORG_NAME": "Spark",
+    "SELF_HOSTED_ORG_SLUG": "spark",
     // VITE_PUBLIC_SITE_URL is intentionally unset: with no static URL the worker
     // derives the web base URL from each request's origin (RequestWebOrigin), so
     // secret/OAuth handoff links match whatever host the user actually reached.

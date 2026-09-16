@@ -1,7 +1,7 @@
 import { makeCloudflareApp } from "./app";
 import {
-  cloudflareAccessConfigErrorMessage,
-  missingCloudflareAccessVars,
+  cloudflareAuthConfigErrorMessage,
+  missingCloudflareAuthVars,
   type CloudflareEnv,
 } from "./config";
 
@@ -31,8 +31,8 @@ const resolveHandler = (env: CloudflareEnv) => {
   return handlerPromise;
 };
 
-const accessConfigErrorResponse = (missingVars: readonly string[]): Response =>
-  new Response(`${cloudflareAccessConfigErrorMessage(missingVars)}\n`, {
+const authConfigErrorResponse = (missingVars: readonly string[]): Response =>
+  new Response(`${cloudflareAuthConfigErrorMessage(missingVars)}\n`, {
     status: 503,
     headers: {
       "cache-control": "no-store",
@@ -42,9 +42,9 @@ const accessConfigErrorResponse = (missingVars: readonly string[]): Response =>
 
 export default {
   fetch: async (request: Request, env: CloudflareEnv, ctx: ExecutionContext): Promise<Response> => {
-    const missingAccessVars = missingCloudflareAccessVars(env);
-    if (missingAccessVars.length > 0) {
-      return accessConfigErrorResponse(missingAccessVars);
+    const missingAuthVars = missingCloudflareAuthVars(env);
+    if (missingAuthVars.length > 0) {
+      return authConfigErrorResponse(missingAuthVars);
     }
 
     const serve = await resolveHandler(env);

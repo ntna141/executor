@@ -9,12 +9,14 @@ let warnedNoCloudflareOrigin = false;
 // Cloudflare host config. Unlike self-host (process.env + a data dir), a Worker
 // receives its bindings + vars per request as `env`, so config is derived from
 // that object — there is no process.env, no filesystem, no boot-time secret
-// generation. Identity comes entirely from Cloudflare Access in front of the
-// Worker; the only real secret is the at-rest secret-encryption key.
+// generation. Identity is supplied by Cloudflare Access or a trusted JWT
+// selected by AUTH_MODE.
 // ---------------------------------------------------------------------------
 
 export const CLOUDFLARE_NAMESPACE = "executor_cloudflare";
 export const CLOUDFLARE_SCHEMA_VERSION = "1.0.0";
+
+export type CloudflareAuthMode = "access" | "trusted-jwt";
 
 export interface CloudflareEnv {
   /** D1 database binding — the app's SQLite store. */
@@ -30,6 +32,10 @@ export interface CloudflareEnv {
    *  Worker's stateless isolates. */
   readonly MCP_SESSION: DurableObjectNamespace;
   readonly MCP_EXECUTION_OWNER?: DurableObjectNamespace;
+  /** Private service binding to the Spark backend Worker. */
+  readonly SPARK_TOOLS?: Fetcher;
+  /** Selects the request identity verifier. Defaults to Cloudflare Access. */
+  readonly AUTH_MODE?: string;
   /** Zero Trust team domain, e.g. `your-team.cloudflareaccess.com`. */
   readonly ACCESS_TEAM_DOMAIN?: string;
   /** The Access application's AUD tag (the JWT audience to verify). */
@@ -38,6 +44,16 @@ export interface CloudflareEnv {
   readonly ACCESS_NAME_CLAIM?: string;
   /** Claim holding the user's groups (default `groups`). */
   readonly ACCESS_GROUPS_CLAIM?: string;
+  /** Verifies Spark-to-Executor JWTs and persistent MCP capabilities. */
+  readonly SPARK_TO_EXECUTOR_JWT_SECRET?: string;
+  readonly TRUSTED_JWT_ISSUER?: string;
+  readonly TRUSTED_JWT_AUDIENCE?: string;
+  /** Claim that carries the Executor tenant id. Defaults to `org`. */
+  readonly TRUSTED_JWT_ORGANIZATION_CLAIM?: string;
+  /** Public origin described by Spark's OpenAPI document. */
+  readonly SPARK_TOOLS_ORIGIN?: string;
+  /** Signs short-lived Executor-to-Spark tool requests. */
+  readonly EXECUTOR_TO_SPARK_JWT_SECRET?: string;
   /** Comma-separated emails granted the admin role. */
   readonly ADMIN_EMAILS?: string;
   /** The single organization id/name every authenticated user belongs to. */
@@ -59,10 +75,17 @@ export interface CloudflareEnv {
 }
 
 export interface CloudflareConfig {
+  readonly authMode: CloudflareAuthMode;
   readonly accessTeamDomain: string;
   readonly accessAud: string;
   readonly accessNameClaim: string;
   readonly accessGroupsClaim: string;
+  readonly sparkToExecutorJwtSecret: string;
+  readonly trustedJwtIssuer: string;
+  readonly trustedJwtAudience: string;
+  readonly trustedJwtOrganizationClaim: string;
+  readonly sparkToolsOrigin: string;
+  readonly executorToSparkJwtSecret: string;
   readonly adminEmails: readonly string[];
   readonly organizationId: string;
   readonly organizationName: string;
@@ -78,12 +101,18 @@ export interface CloudflareConfig {
 
 type CloudflareConfigEnv = Omit<
   CloudflareEnv,
-  "DB" | "BLOBS" | "ASSETS" | "MCP_SESSION" | "MCP_EXECUTION_OWNER"
+  "DB" | "BLOBS" | "ASSETS" | "MCP_SESSION" | "MCP_EXECUTION_OWNER" | "SPARK_TOOLS"
 >;
 
-type CloudflareAccessEnv = Pick<
+type CloudflareAuthEnv = Pick<
   CloudflareConfigEnv,
-  "ACCESS_TEAM_DOMAIN" | "ACCESS_AUD" | "ENABLE_DEV_AUTH"
+  | "AUTH_MODE"
+  | "ACCESS_TEAM_DOMAIN"
+  | "ACCESS_AUD"
+  | "SPARK_TO_EXECUTOR_JWT_SECRET"
+  | "TRUSTED_JWT_ISSUER"
+  | "TRUSTED_JWT_AUDIENCE"
+  | "ENABLE_DEV_AUTH"
 >;
 
 const splitLower = (value: string | undefined): readonly string[] =>
@@ -98,8 +127,25 @@ const normalizeAccessTeamDomain = (value: string | undefined): string =>
     .replace(/^https?:\/\//, "")
     .replace(/\/+$/, "");
 
-export const missingCloudflareAccessVars = (env: CloudflareAccessEnv): readonly string[] => {
+const resolveAuthMode = (value: string | undefined): CloudflareAuthMode => {
+  const mode = value?.trim() || "access";
+  if (mode === "access" || mode === "trusted-jwt") return mode;
+  // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- configuration boundary: refuse an unknown authentication mode
+  throw new Error(`AUTH_MODE must be "access" or "trusted-jwt", received ${JSON.stringify(mode)}`);
+};
+
+export const missingCloudflareAuthVars = (env: CloudflareAuthEnv): readonly string[] => {
   if (env.ENABLE_DEV_AUTH === "true") return [];
+  const authMode = resolveAuthMode(env.AUTH_MODE);
+  if (authMode === "trusted-jwt") {
+    return [
+      ...((env.SPARK_TO_EXECUTOR_JWT_SECRET ?? "").trim().length < 32
+        ? ["SPARK_TO_EXECUTOR_JWT_SECRET"]
+        : []),
+      ...((env.TRUSTED_JWT_ISSUER ?? "").trim().length === 0 ? ["TRUSTED_JWT_ISSUER"] : []),
+      ...((env.TRUSTED_JWT_AUDIENCE ?? "").trim().length === 0 ? ["TRUSTED_JWT_AUDIENCE"] : []),
+    ];
+  }
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
   return [
@@ -111,8 +157,8 @@ export const missingCloudflareAccessVars = (env: CloudflareAccessEnv): readonly 
   ];
 };
 
-export const cloudflareAccessConfigErrorMessage = (missingVars: readonly string[]): string =>
-  `Cloudflare Access is not configured. Set ${missingVars.join(" and ")} before serving requests.`;
+export const cloudflareAuthConfigErrorMessage = (missingVars: readonly string[]): string =>
+  `Executor authentication is not configured. Set ${missingVars.join(" and ")} before serving requests.`;
 
 // The org slug doubles as a URL segment (`/<slug>/policies`), so an
 // operator-set value must fit the shared grammar and avoid reserved root
@@ -138,12 +184,13 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     );
   }
   const enableDevAuth = env.ENABLE_DEV_AUTH === "true";
+  const authMode = resolveAuthMode(env.AUTH_MODE);
   const accessTeamDomain = normalizeAccessTeamDomain(env.ACCESS_TEAM_DOMAIN);
   const accessAud = (env.ACCESS_AUD ?? "").trim();
-  const missingAccessVars = missingCloudflareAccessVars(env);
-  if (missingAccessVars.length > 0) {
-    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: production must fail closed without a valid Access verifier
-    throw new Error(cloudflareAccessConfigErrorMessage(missingAccessVars));
+  const missingAuthVars = missingCloudflareAuthVars(env);
+  if (missingAuthVars.length > 0) {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: production must fail closed without a valid identity verifier
+    throw new Error(cloudflareAuthConfigErrorMessage(missingAuthVars));
   }
   const webBaseUrl = resolvePublicOrigin({ explicit: env.VITE_PUBLIC_SITE_URL, env: {} });
   if (!webBaseUrl && !enableDevAuth && !warnedNoCloudflareOrigin) {
@@ -156,10 +203,17 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     );
   }
   return {
+    authMode,
     accessTeamDomain,
     accessAud,
     accessNameClaim: env.ACCESS_NAME_CLAIM ?? "name",
     accessGroupsClaim: env.ACCESS_GROUPS_CLAIM ?? "groups",
+    sparkToExecutorJwtSecret: env.SPARK_TO_EXECUTOR_JWT_SECRET?.trim() ?? "",
+    trustedJwtIssuer: env.TRUSTED_JWT_ISSUER?.trim() ?? "",
+    trustedJwtAudience: env.TRUSTED_JWT_AUDIENCE?.trim() ?? "",
+    trustedJwtOrganizationClaim: env.TRUSTED_JWT_ORGANIZATION_CLAIM?.trim() || "org",
+    sparkToolsOrigin: env.SPARK_TOOLS_ORIGIN?.trim().replace(/\/+$/, "") ?? "",
+    executorToSparkJwtSecret: env.EXECUTOR_TO_SPARK_JWT_SECRET?.trim() ?? "",
     adminEmails: splitLower(env.ADMIN_EMAILS),
     organizationId: env.SELF_HOSTED_ORG_ID ?? "default",
     organizationName: env.SELF_HOSTED_ORG_NAME ?? "Default",

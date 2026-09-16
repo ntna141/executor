@@ -1536,7 +1536,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         "skills",
         {
           description: [
-            "Documentation for THIS server's own tools. Not a general skill reader: it serves a short, fixed set of how-to docs about using `execute` and artifacts here, and it cannot reach your harness's skills, a SKILL.md on disk, or any user- or project-authored skill. The argument is a name from its own catalog, never a path or an outside skill's id.",
+            "Documentation for THIS server's own tools. Not a general skill reader: it serves a short, fixed set of how-to docs about using the tools available on this connection, and it cannot reach your harness's skills, a SKILL.md on disk, or any user- or project-authored skill. The argument is a name from its own catalog, never a path or an outside skill's id.",
             "These docs hold the long-form guidance that would otherwise bloat another tool's always-loaded description.",
             'Call `skills({ name: "execute" })` for the full guide to writing code for the `execute` tool (search the catalog, call tools, emit results, resume paused runs).',
             "Call with no name to list the few docs available.",

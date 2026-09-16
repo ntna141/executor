@@ -11,6 +11,8 @@ import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { encryptedSecretsPlugin } from "@executor-js/plugin-encrypted-secrets";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
+import type { HttpClient } from "effect/unstable/http";
+import type { Layer } from "effect";
 
 // ---------------------------------------------------------------------------
 // The Cloudflare host's plugin list — the same protocol/provider plugins as
@@ -25,17 +27,36 @@ import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
 
 export const makeCloudflarePlugins = (
   secretKey: string,
-  options: { readonly activeToolkitSlug?: string; readonly allowLocalNetwork?: boolean } = {},
-) =>
-  [
+  options: {
+    readonly activeToolkitSlug?: string;
+    readonly allowLocalNetwork?: boolean;
+    readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
+    readonly sparkToolsOrigin?: string;
+  } = {},
+) => {
+  const sparkToolsPresets = options.sparkToolsOrigin
+    ? [
+        {
+          id: "spark-tools",
+          name: "Spark",
+          summary: "Notes, todos, contacts, calendar, email, maps, and artifacts.",
+          url: `${options.sparkToolsOrigin}/executor/openapi.json`,
+          featured: true,
+          defaultSlug: "spark",
+        },
+      ]
+    : [];
+  return [
     openApiHttpPlugin({
-      presets: [...googleCatalog, ...microsoftCatalog],
+      presets: [...sparkToolsPresets, ...googleCatalog, ...microsoftCatalog],
       specFormats: [googleDiscoveryAdapter, microsoftGraphAdapter],
+      httpClientLayer: options.httpClientLayer,
     }),
     mcpHttpPlugin({ dangerouslyAllowStdioMCP: false }),
     graphqlHttpPlugin(),
     toolkitsPlugin({ activeToolkitSlug: options.activeToolkitSlug }),
     encryptedSecretsPlugin({ key: secretKey }),
   ] as const;
+};
 
 export type CloudflarePlugins = ReturnType<typeof makeCloudflarePlugins>;

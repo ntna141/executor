@@ -7,7 +7,8 @@ import {
   type McpDiscoveryRoute,
 } from "@executor-js/host-mcp";
 
-import { makeAccessVerifier } from "../auth/cloudflare-access";
+import { makeIdentityVerifier } from "../auth/identity";
+import { makeSparkMcpCapabilityVerifier } from "../auth/spark-mcp-capability";
 import type { CloudflareConfig } from "../config";
 
 const PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource";
@@ -54,23 +55,18 @@ const protectedResourceMetadataResponse = (request: Request): Response => {
 };
 
 // ---------------------------------------------------------------------------
-// Cloudflare Access McpAuthProvider — the `/mcp` gate, identical identity to the
-// API gate. Cloudflare Access sits in front of the Worker and forwards the
-// signed `Cf-Access-Jwt-Assertion` on every request, including `/mcp`. So the
-// MCP auth seam reuses the SAME `makeAccessVerifier` the IdentityProvider uses:
-// validate the JWT, map claims onto the neutral `Principal`, done.
+// Cloudflare McpAuthProvider — the `/mcp` gate, with the same identity as the
+// API gate. Spark's WorkAgent can also present a persistent, conversation-bound
+// capability so the Agents SDK can restore its MCP connection after hibernation.
 //
-// There is no MCP OAuth here. Auth is Access's browser/service-token flow, not
-// the MCP `/authorize`+`/token` dance — so `discoveryRoutes` is empty and the
-// 401 challenge points at a nominal protected-resource URL only to satisfy
-// clients that probe for it. An external MCP client authenticates by presenting
-// an Access JWT (or `Cf-Access-Client-Id`/`-Secret` service-token headers, which
-// Access converts to one). When MCP OAuth-over-Access is needed, add the
-// discovery docs + a token endpoint here behind this same seam.
+// There is no MCP OAuth exchange here. The caller presents a JWT or a Spark MCP
+// capability that the host already trusts. Protected-resource metadata exists
+// for clients that probe for it, but it advertises no authorization server.
 // ---------------------------------------------------------------------------
 
-export const cloudflareAccessMcpAuth = (config: CloudflareConfig): Layer.Layer<McpAuthProvider> => {
-  const { verify } = makeAccessVerifier(config);
+export const cloudflareMcpAuth = (config: CloudflareConfig): Layer.Layer<McpAuthProvider> => {
+  const { verify: verifyIdentity } = makeIdentityVerifier(config);
+  const { verify: verifySparkCapability } = makeSparkMcpCapabilityVerifier(config);
   const discoveryRoutes: ReadonlyArray<McpDiscoveryRoute> = [
     {
       path: PROTECTED_RESOURCE_METADATA_PATH,
@@ -90,7 +86,10 @@ export const cloudflareAccessMcpAuth = (config: CloudflareConfig): Layer.Layer<M
     resourceMetadataUrl: (request) =>
       new URL(metadataPathForRequest(request), new URL(request.url).origin).toString(),
     authenticate: (request) =>
-      verify(request).pipe(
+      verifySparkCapability(request).pipe(
+        Effect.flatMap((principal) =>
+          principal ? Effect.succeed(principal) : verifyIdentity(request),
+        ),
         Effect.map((principal) => (principal ? authenticated(principal) : unauthorized())),
       ),
   });

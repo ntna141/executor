@@ -18,7 +18,7 @@ import type { McpSessionProps } from "@executor-js/cloudflare/mcp/agent-durable-
 import { mcpSessionStub } from "@executor-js/cloudflare/mcp/session-stub";
 
 import type { CloudflareConfig, CloudflareEnv } from "../config";
-import { cloudflareAccessMcpAuth } from "./auth";
+import { cloudflareMcpAuth } from "./auth";
 import { McpSessionDO } from "./session-durable-object";
 
 const corsPreflightResponse = (): Response =>
@@ -67,7 +67,7 @@ const authenticate = (request: Request, config: CloudflareConfig) =>
     const auth = yield* McpAuthProvider;
     const outcome = yield* auth.authenticate(request);
     return { auth, outcome };
-  }).pipe(Effect.provide(cloudflareAccessMcpAuth(config)));
+  }).pipe(Effect.provide(cloudflareMcpAuth(config)));
 
 const propsForPrincipal = (
   request: Request,

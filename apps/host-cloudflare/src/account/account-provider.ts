@@ -7,31 +7,30 @@ import {
 } from "@executor-js/api/server";
 import { AccountError, AccountUnauthorized } from "@executor-js/api";
 
-import { makeAccessVerifier } from "../auth/cloudflare-access";
+import { makeIdentityVerifier } from "../auth/identity";
 import type { CloudflareConfig } from "../config";
 
 // ---------------------------------------------------------------------------
 // Cloudflare AccountProvider — backs the shared `/account/*` surface the
-// multiplayer shell reads. Cloudflare Access is the identity, so `me` just
-// reflects the Access principal (the same `makeAccessVerifier` the API gate
-// uses), reading the `Cf-Access-Jwt-Assertion` header off the request.
+// multiplayer shell reads. `me` reflects the same principal that the API and
+// MCP gates resolve from the configured identity verifier.
 //
-// Single-tenant + Access-managed: members, roles, and API keys live in
-// Cloudflare Access, NOT in the app. The shell hides the API-keys footer and
+// Host-managed: members, roles, and API keys live outside Executor. The shell
+// hides the API-keys footer and
 // shows no members page, so those methods are never reached from the UI; they
-// return empty (reads) or a clear "managed by Cloudflare Access" error (writes)
+// return empty (reads) or a clear "managed by the host" error (writes)
 // to satisfy the provider shape.
 // ---------------------------------------------------------------------------
 
-const NOT_IN_APP = "Managed by Cloudflare Access, not in the app.";
+const NOT_IN_APP = "Managed by the host identity system, not in the app.";
 
 export const cloudflareAccountProvider = (
   config: CloudflareConfig,
 ): Layer.Layer<AccountProvider> => {
-  const { verify } = makeAccessVerifier(config);
+  const { verify } = makeIdentityVerifier(config);
 
   // The provider gets raw headers; rebuild a minimal Request so `verify` can
-  // read the Access assertion header (and honor the dev-auth bypass).
+  // read the configured bearer header (and honor the dev-auth bypass).
   const principalFrom = (headers: AccountHeaders) =>
     verify(new Request("https://internal.local/", { headers: new Headers(headers) }));
 
@@ -52,7 +51,7 @@ export const cloudflareAccountProvider = (
                 organization: {
                   id: principal.organizationId,
                   name: principal.organizationName,
-                  slug: config.organizationSlug,
+                  slug: principal.organizationSlug ?? config.organizationSlug,
                 },
               })
             : Effect.fail(new AccountUnauthorized()),
@@ -61,7 +60,7 @@ export const cloudflareAccountProvider = (
     listApiKeys: () => Effect.succeed({ apiKeys: [] }),
     createApiKey: () => forbiddenWrite,
     revokeApiKey: () => forbiddenWrite,
-    // Org-owned keys are a WorkOS concept; Access-managed instances have no
+    // Org-owned keys are a WorkOS concept; host-managed instances have no
     // credential store of their own to mint one from.
     listOrgApiKeys: () => Effect.succeed({ apiKeys: [] }),
     createOrgApiKey: () => forbiddenWrite,

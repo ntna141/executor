@@ -213,6 +213,9 @@ export const buildOAuthRedirectUri = (input: {
 
 export interface PluginsProviderContext {
   readonly mcpResource?: McpResource;
+  /** The member identity bound to this executor instance. */
+  readonly accountId?: string;
+  readonly organizationId?: string;
 }
 
 export interface PluginsProviderShape {
@@ -294,7 +297,13 @@ export const makeScopedExecutor = <
       oauthCallbackPath: config.oauthCallbackPath,
     });
 
-    const plugins = yield* Effect.sync(() => pluginsFactory(options?.plugins));
+    const plugins = yield* Effect.sync(() =>
+      pluginsFactory({
+        ...options?.plugins,
+        accountId,
+        organizationId,
+      }),
+    );
     const hostedHttpOptions = {
       allowLocalNetwork: config.allowLocalNetwork,
     };

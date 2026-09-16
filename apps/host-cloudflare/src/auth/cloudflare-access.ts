@@ -1,7 +1,7 @@
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { Effect, Layer } from "effect";
+import { Effect } from "effect";
 
-import { IdentityProvider, Unauthorized, type Principal } from "@executor-js/api/server";
+import type { Principal } from "@executor-js/api/server";
 
 import type { CloudflareConfig } from "../config";
 
@@ -97,20 +97,4 @@ export const makeAccessVerifier = (config: CloudflareConfig) => {
     });
 
   return { verify };
-};
-
-export const cloudflareAccessIdentityLayer = (
-  config: CloudflareConfig,
-): Layer.Layer<IdentityProvider> => {
-  const { verify } = makeAccessVerifier(config);
-  return Layer.succeed(IdentityProvider)(
-    IdentityProvider.of({
-      authenticate: (request) =>
-        verify(request).pipe(
-          Effect.flatMap((principal) =>
-            principal ? Effect.succeed(principal) : Effect.fail(new Unauthorized()),
-          ),
-        ),
-    }),
-  );
 };

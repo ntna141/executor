@@ -6,7 +6,7 @@ import { dbProviderLayer, ExecutorApp, textFailureStrategy } from "@executor-js/
 import { loadConfig, type CloudflareEnv } from "./config";
 import { makeCloudflarePlugins } from "./plugins";
 import { createD1ExecutorDb } from "./db/d1";
-import { cloudflareAccessIdentityLayer } from "./auth/cloudflare-access";
+import { cloudflareIdentityLayer } from "./auth/identity";
 import {
   CloudflareCodeExecutorProvider,
   makeCloudflareHostConfig,
@@ -22,10 +22,9 @@ import { preloadQuickJs } from "./quickjs";
 // The Cloudflare host, as ONE `ExecutorApp.make` call: the 4th app alongside
 // cloud / self-host / local, differing only by the injected Layers.
 //
-// The whole scenario in 60 seconds: Cloudflare Access is the identity (validate
-// the Cf-Access-Jwt-Assertion JWT, no Better Auth, no WorkOS, no app login),
-// D1 is the SQLite store (same FumaDB assembly as self-host), QuickJS is the
-// in-process code substrate, no billing, single-tenant. `diff` against
+// The whole scenario in 60 seconds: the configured host verifier supplies the
+// identity, D1 is the SQLite store (same FumaDB assembly as self-host), QuickJS
+// is the in-process code substrate, and there is no billing. `diff` against
 // host-selfhost/src/app.ts is three injected Layers: identity, db, plugins/config.
 //
 // Built per isolate (async) so the D1 schema bring-up happens once at first
@@ -35,7 +34,9 @@ import { preloadQuickJs } from "./quickjs";
 
 export const makeCloudflareApp = async (env: CloudflareEnv) => {
   const config = loadConfig(env);
-  const plugins = makeCloudflarePlugins(config.secretKey);
+  const plugins = makeCloudflarePlugins(config.secretKey, {
+    sparkToolsOrigin: config.sparkToolsOrigin,
+  });
 
   // Load the Workers-compatible (WASM-inlined) QuickJS variant before any
   // executor is built, the default variant cannot fetch its .wasm on Workers.
@@ -44,7 +45,7 @@ export const makeCloudflareApp = async (env: CloudflareEnv) => {
   // Open and idempotently bring up the D1 schema once. This is the long-lived
   // handle the per-request scoped executor reads through the DbProvider seam.
   const dbHandle = await createD1ExecutorDb(env.DB, env.BLOBS);
-  const identityLayer = cloudflareAccessIdentityLayer(config);
+  const identityLayer = cloudflareIdentityLayer(config);
   const mcpAgentHandler = makeCloudflareMcpAgentHandler(config);
   const approvalHandler = makeCloudflareApprovalHandler(config, env);
 
@@ -60,15 +61,15 @@ export const makeCloudflareApp = async (env: CloudflareEnv) => {
       },
       errorCapture: ErrorCaptureLive,
       // The account API (`/api/account/*`) backs the shared multiplayer shell's
-      // auth context; `me` reflects the Access principal. Members/keys are
-      // Access-managed, so the rest of the surface is stubbed.
+      // auth context; `me` reflects the verified principal. Members/keys are
+      // host-managed, so the rest of the surface is stubbed.
       account: cloudflareAccountMiddleware(config),
     },
     extensions: {
       routes: [
         // Browser approval of paused MCP executions: the console resume page
         // reads paused detail (GET) and records the decision (POST .../resume),
-        // Access-gated, routed to the owning session's Durable Object.
+        // Identity-gated, routed to the owning session's Durable Object.
         HttpRouter.add("*", "/api/mcp-sessions/*", HttpEffect.fromWebHandler(approvalHandler)),
       ],
     },
