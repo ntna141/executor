@@ -7,7 +7,8 @@ submodule at `executor/`.
 
 To update: merge upstream `main` into `spark`, resolve conflicts, push, then bump the submodule
 pointer in `halo-g1`. Keep the Spark trusted-JWT adapter in `apps/host-cloudflare/src/auth`, the
-Spark tools bridge in `apps/host-cloudflare/src/spark-tools.ts`, the host-operated OAuth apps in
+Spark tools bridge in `apps/host-cloudflare/src/spark-tools.ts`, the static Spark integration in
+`apps/host-cloudflare/src/spark-tools-plugin.ts`, the host-operated OAuth apps in
 `apps/host-cloudflare/src/first-party-oauth-clients.ts`, and the identity pass-through in
 `packages/core/api/src/server/scoped-executor.ts`. Both Spark credentials bind the tenant to the
 Spark user id: every user is their own Executor workspace (see `auth/trusted-jwt.ts`).

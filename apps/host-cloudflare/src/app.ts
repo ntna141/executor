@@ -11,6 +11,7 @@ import {
   CloudflareCodeExecutorProvider,
   makeCloudflareHostConfig,
   makeCloudflarePluginsProvider,
+  preloadSparkToolCatalog,
 } from "./execution";
 import { ErrorCaptureLive } from "./observability";
 import { cloudflareAccountMiddleware } from "./account/account-provider";
@@ -34,13 +35,15 @@ import { preloadQuickJs } from "./quickjs";
 
 export const makeCloudflareApp = async (env: CloudflareEnv) => {
   const config = loadConfig(env);
-  const plugins = makeCloudflarePlugins(config.secretKey, {
-    sparkToolsOrigin: config.sparkToolsOrigin,
-  });
 
   // Load the Workers-compatible (WASM-inlined) QuickJS variant before any
   // executor is built, the default variant cannot fetch its .wasm on Workers.
-  await preloadQuickJs();
+  // Spark's tool document is loaded the same way: the static Spark integration
+  // is built from it and the plugin seam cannot await.
+  await Promise.all([preloadQuickJs(), preloadSparkToolCatalog(config)]);
+  const plugins = makeCloudflarePlugins(config.secretKey, {
+    sparkTools: { origin: config.sparkToolsOrigin, definitions: [] },
+  });
 
   // Open and idempotently bring up the D1 schema once. This is the long-lived
   // handle the per-request scoped executor reads through the DbProvider seam.

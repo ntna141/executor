@@ -11,8 +11,8 @@ import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { encryptedSecretsPlugin } from "@executor-js/plugin-encrypted-secrets";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
-import type { HttpClient } from "effect/unstable/http";
-import type { Layer } from "effect";
+
+import { sparkToolsPlugin, type SparkToolsPluginOptions } from "./spark-tools-plugin";
 
 // ---------------------------------------------------------------------------
 // The Cloudflare host's plugin list — the same protocol/provider plugins as
@@ -23,6 +23,11 @@ import type { Layer } from "effect";
 //
 // `dangerouslyAllowStdioMCP` is false: a multi-user instance must not let a user
 // spawn arbitrary stdio MCP processes.
+//
+// Spark's own tools are a STATIC integration (spark-tools-plugin.ts): present
+// in every tenant with no rows, bound to the acting user through the signed
+// fetch the provider passes in. The plugin is always in the tuple so the API
+// and table shape never depend on whether an identity was available.
 // ---------------------------------------------------------------------------
 
 export const makeCloudflarePlugins = (
@@ -30,33 +35,19 @@ export const makeCloudflarePlugins = (
   options: {
     readonly activeToolkitSlug?: string;
     readonly allowLocalNetwork?: boolean;
-    readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
-    readonly sparkToolsOrigin?: string;
+    readonly sparkTools?: SparkToolsPluginOptions;
   } = {},
-) => {
-  const sparkToolsPresets = options.sparkToolsOrigin
-    ? [
-        {
-          id: "spark-tools",
-          name: "Spark",
-          summary: "Notes, todos, contacts, calendar, email, maps, and artifacts.",
-          url: `${options.sparkToolsOrigin}/executor/openapi.json`,
-          featured: true,
-          defaultSlug: "spark",
-        },
-      ]
-    : [];
-  return [
+) =>
+  [
     openApiHttpPlugin({
-      presets: [...sparkToolsPresets, ...googleCatalog, ...microsoftCatalog],
+      presets: [...googleCatalog, ...microsoftCatalog],
       specFormats: [googleDiscoveryAdapter, microsoftGraphAdapter],
-      httpClientLayer: options.httpClientLayer,
     }),
     mcpHttpPlugin({ dangerouslyAllowStdioMCP: false }),
     graphqlHttpPlugin(),
     toolkitsPlugin({ activeToolkitSlug: options.activeToolkitSlug }),
     encryptedSecretsPlugin({ key: secretKey }),
+    sparkToolsPlugin(options.sparkTools),
   ] as const;
-};
 
 export type CloudflarePlugins = ReturnType<typeof makeCloudflarePlugins>;

@@ -16,7 +16,8 @@ import { env } from "cloudflare:workers";
 
 import type { CloudflareConfig } from "./config";
 import { makeCloudflarePlugins } from "./plugins";
-import { makeSparkToolsHttpClientLayer } from "./spark-tools";
+import { makeSparkToolsFetch } from "./spark-tools";
+import { loadedSparkTools, preloadSparkTools } from "./spark-tools-plugin";
 
 // ---------------------------------------------------------------------------
 // Cloudflare execution-stack seams — the same shape as self-host (QuickJS code
@@ -40,12 +41,28 @@ export const CloudflareCodeExecutorProvider: Layer.Layer<CodeExecutorProvider> =
   },
 );
 
+const sparkToolsBinding = (): Fetcher | undefined => (env as { SPARK_TOOLS?: Fetcher }).SPARK_TOOLS;
+
+/**
+ * Loads Spark's tool document once per isolate. Must run before the plugin
+ * list is built (app boot, and the MCP session DO next to `preloadQuickJs`)
+ * because the plugin seam is synchronous. The document is public, so it is
+ * read through the service binding when bound and the public origin otherwise.
+ */
+export const preloadSparkToolCatalog = (config: CloudflareConfig): Promise<unknown> => {
+  if (!config.sparkToolsOrigin) return Promise.resolve([]);
+  const binding = sparkToolsBinding();
+  return preloadSparkTools({
+    origin: config.sparkToolsOrigin,
+    fetch: (input) => (binding ? binding.fetch(input) : fetch(input)),
+  });
+};
+
 export const makeCloudflarePluginsProvider = (
   config: CloudflareConfig,
 ): Layer.Layer<PluginsProvider> =>
   Layer.succeed(PluginsProvider)({
     plugins: (context) => {
-      const runtimeEnv = env as { SPARK_TOOLS?: Fetcher };
       const identity =
         context?.accountId && context.organizationId
           ? {
@@ -57,16 +74,20 @@ export const makeCloudflarePluginsProvider = (
         activeToolkitSlug:
           context?.mcpResource?.kind === "toolkit" ? context.mcpResource.slug : undefined,
         allowLocalNetwork: config.allowLocalNetwork,
-        sparkToolsOrigin: config.sparkToolsOrigin,
-        httpClientLayer: identity
-          ? makeSparkToolsHttpClientLayer({
-              binding: runtimeEnv.SPARK_TOOLS,
-              origin: config.sparkToolsOrigin,
-              secret: config.executorToSparkJwtSecret,
-              allowLocalNetwork: config.allowLocalNetwork,
-              ...identity,
-            })
-          : undefined,
+        sparkTools: {
+          origin: config.sparkToolsOrigin,
+          definitions: loadedSparkTools(),
+          fetch:
+            identity && config.sparkToolsOrigin
+              ? makeSparkToolsFetch({
+                  binding: sparkToolsBinding(),
+                  origin: config.sparkToolsOrigin,
+                  secret: config.executorToSparkJwtSecret,
+                  allowLocalNetwork: config.allowLocalNetwork,
+                  ...identity,
+                })
+              : undefined,
+        },
       });
     },
   });

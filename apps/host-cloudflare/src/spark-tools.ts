@@ -1,8 +1,5 @@
 import { SignJWT } from "jose";
-import type { HttpClient } from "effect/unstable/http";
-import { Data, type Layer } from "effect";
-
-import { makeHostedHttpClientLayer } from "@executor-js/sdk/host-internal";
+import { Data } from "effect";
 
 const EXECUTOR_TOOL_ISSUER = "executor";
 const EXECUTOR_TOOL_AUDIENCE = "spark-tools";
@@ -69,11 +66,3 @@ export const makeSparkToolsFetch = (options: SparkToolsFetchOptions): typeof glo
     return options.binding.fetch(new Request(request, { headers }));
   };
 };
-
-export const makeSparkToolsHttpClientLayer = (
-  options: SparkToolsFetchOptions,
-): Layer.Layer<HttpClient.HttpClient> =>
-  makeHostedHttpClientLayer({
-    fetch: makeSparkToolsFetch(options),
-    allowLocalNetwork: options.allowLocalNetwork,
-  });

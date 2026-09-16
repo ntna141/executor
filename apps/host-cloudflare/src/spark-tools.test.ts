@@ -3,23 +3,41 @@ import { describe, expect, it } from "@effect/vitest";
 
 import { makeSparkToolsFetch } from "./spark-tools";
 import { makeCloudflarePlugins } from "./plugins";
+import { SPARK_INTEGRATION_ID } from "./spark-tools-plugin";
 
 const secret = "spark-tools-test-secret-012345678901";
 const origin = "https://spark.example.com";
 
 describe("makeSparkToolsFetch", () => {
-  it("adds Spark as a first-party OpenAPI preset", () => {
-    const [openapi] = makeCloudflarePlugins("x".repeat(32), {
-      sparkToolsOrigin: origin,
+  it("contributes Spark as a static integration bound to the acting user", () => {
+    const plugins = makeCloudflarePlugins("x".repeat(32), {
+      sparkTools: {
+        origin,
+        definitions: [{ name: "create_note", description: "Create a note", inputSchema: {} }],
+        fetch: async () => Response.json({ ok: true }),
+      },
     });
+    const spark = plugins.find((plugin) => plugin.id === "spark-tools");
 
-    expect(openapi.integrationPresets).toContainEqual(
+    expect(spark?.staticIntegrations?.({})).toEqual([
       expect.objectContaining({
-        id: "spark-tools",
-        url: `${origin}/executor/openapi.json`,
-        defaultSlug: "spark",
+        id: SPARK_INTEGRATION_ID,
+        kind: "spark",
+        canRemove: false,
+        tools: [expect.objectContaining({ name: "create_note" })],
       }),
-    );
+    ]);
+    expect(
+      plugins.find((plugin) => plugin.id === "openapi")?.integrationPresets,
+    ).not.toContainEqual(expect.objectContaining({ id: "spark-tools" }));
+  });
+
+  it("contributes no Spark tools without an identity-bound fetch", () => {
+    const plugins = makeCloudflarePlugins("x".repeat(32), {
+      sparkTools: { origin, definitions: [{ name: "x", description: "x", inputSchema: {} }] },
+    });
+    const spark = plugins.find((plugin) => plugin.id === "spark-tools");
+    expect(spark?.staticIntegrations?.({})).toEqual([]);
   });
 
   it("routes Spark tool requests through the binding with a user JWT", async () => {

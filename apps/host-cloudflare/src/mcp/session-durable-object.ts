@@ -28,7 +28,11 @@ import type { ResumeResponse } from "@executor-js/execution";
 
 import { loadConfig, type CloudflareConfig, type CloudflareEnv } from "../config";
 import { createD1ExecutorDb } from "../db/d1";
-import { makeCloudflareExecutionStackLayer, makeExecutionStack } from "../execution";
+import {
+  makeCloudflareExecutionStackLayer,
+  makeExecutionStack,
+  preloadSparkToolCatalog,
+} from "../execution";
 import { preloadQuickJs } from "../quickjs";
 
 // ---------------------------------------------------------------------------
@@ -146,7 +150,8 @@ export class McpSessionDO extends McpAgentSessionDOBase<CloudflareEnv, CfSession
     return Effect.gen(function* () {
       // QuickJS-WASM must be loaded before the executor layer builds it (the
       // default variant can't fetch its .wasm on Workers). Idempotent per isolate.
-      yield* Effect.promise(() => preloadQuickJs());
+      // The Spark tool catalog is the same story for the static Spark integration.
+      yield* Effect.promise(() => Promise.all([preloadQuickJs(), preloadSparkToolCatalog(config)]));
       const { engine, executor } = yield* makeExecutionStack(
         sessionMeta.userId,
         sessionMeta.organizationId,
