@@ -133,6 +133,34 @@ describe("sparkToolsPlugin", () => {
     }),
   );
 
+  it.effect("raises a url result as a URL elicitation and reports the outcome", () =>
+    Effect.gen(function* () {
+      const tool = handlerFor("create_note", async () =>
+        Response.json({
+          kind: "url",
+          message: "Authorize linear",
+          url: "https://linear.test/authorize",
+        }),
+      );
+      const raised: unknown[] = [];
+      const elicit = (request: unknown) => {
+        raised.push(request);
+        return Effect.succeed({ action: "accept" as const, content: {} });
+      };
+
+      const result = yield* tool.handler({ args: {}, ctx: {} as never, elicit: elicit as never });
+
+      expect(result).toEqual({ completed: true, message: "Authorize linear" });
+      expect(raised).toEqual([
+        expect.objectContaining({
+          _tag: "UrlElicitation",
+          message: "Authorize linear",
+          url: "https://linear.test/authorize",
+        }),
+      ]);
+    }),
+  );
+
   it.effect("fails with Spark's error message on a non-2xx answer", () =>
     Effect.gen(function* () {
       const tool = handlerFor("list_todos", async () =>

@@ -1,6 +1,13 @@
 import { Data, Effect, Option, Schema } from "effect";
 
-import { definePlugin, tool, type StaticToolSchema } from "@executor-js/sdk";
+import {
+  definePlugin,
+  ElicitationId,
+  tool,
+  UrlElicitation,
+  type Elicit,
+  type StaticToolSchema,
+} from "@executor-js/sdk";
 
 // ---------------------------------------------------------------------------
 // Spark tools as a STATIC integration.
@@ -47,6 +54,16 @@ const JsonValue = Schema.fromJsonString(Schema.Unknown);
 const decodeJsonValue = Schema.decodeUnknownOption(JsonValue);
 const ErrorBody = Schema.Struct({ error: Schema.String });
 const decodeErrorBody = Schema.decodeUnknownOption(ErrorBody);
+
+/** A Spark tool result that asks the user to visit a URL (the authorization
+ *  flow). The handler raises it as a URL elicitation: the execution pauses,
+ *  Spark shows the card on the phone, and the callback resumes it. */
+const UrlRequestBody = Schema.Struct({
+  kind: Schema.Literal("url"),
+  message: Schema.String,
+  url: Schema.String,
+});
+const decodeUrlRequest = Schema.decodeUnknownOption(UrlRequestBody);
 
 // ---------------------------------------------------------------------------
 // OpenAPI document -> tool definitions
@@ -223,6 +240,26 @@ const callSparkTool = (
     }),
   );
 
+/** Result of a Spark tool that paused for the user: after the accept, the
+ *  tool reports what the user did rather than the URL again. */
+const raiseUrlRequest = (elicit: Elicit, result: unknown): Effect.Effect<unknown> =>
+  Option.match(decodeUrlRequest(result), {
+    onNone: () => Effect.succeed(result),
+    onSome: (request) =>
+      elicit(
+        UrlElicitation.make({
+          message: request.message,
+          url: request.url,
+          elicitationId: ElicitationId.make(crypto.randomUUID()),
+        }),
+      ).pipe(
+        Effect.map(() => ({ completed: true, message: request.message })),
+        Effect.catchTag("ElicitationDeclinedError", () =>
+          Effect.succeed({ completed: false, message: request.message }),
+        ),
+      ),
+  });
+
 export const sparkToolsPlugin = definePlugin(
   (
     options: SparkToolsPluginOptions = {
@@ -252,7 +289,10 @@ export const sparkToolsPlugin = definePlugin(
               name: definition.name,
               description: definition.description,
               inputSchema: jsonSchemaStandard(definition.inputSchema),
-              execute: (args) => callSparkTool(options, fetch, definition.name, args),
+              execute: (args, { elicit }) =>
+                callSparkTool(options, fetch, definition.name, args).pipe(
+                  Effect.flatMap((result) => raiseUrlRequest(elicit, result)),
+                ),
             }),
           ),
         },
