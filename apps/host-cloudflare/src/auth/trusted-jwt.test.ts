@@ -55,6 +55,8 @@ describe("makeTrustedJwtVerifier", () => {
         accountId: "user-1",
         organizationId: "org-1",
         roles: ["member"],
+        orgRoleModel: "organization",
+        orgRole: "member",
       });
     }),
   );
@@ -85,6 +87,19 @@ describe("makeTrustedJwtVerifier", () => {
       expect(principal).toMatchObject({
         accountId: "user-1",
         organizationId: "spark",
+      });
+    }),
+  );
+
+  it.effect("promotes a signed admin role claim to workspace admin", () =>
+    Effect.gen(function* () {
+      const signedToken = yield* Effect.promise(() => token({ role: "admin" }));
+      const principal = yield* makeTrustedJwtVerifier(config).verify(requestWith(signedToken));
+
+      expect(principal).toMatchObject({
+        roles: ["admin"],
+        orgRoleModel: "organization",
+        orgRole: "admin",
       });
     }),
   );

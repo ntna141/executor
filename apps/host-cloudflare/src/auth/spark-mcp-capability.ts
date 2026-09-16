@@ -26,6 +26,10 @@ const sparkPrincipal = (userId: string, config: CloudflareConfig): Principal => 
   name: null,
   avatarUrl: null,
   roles: ["member"],
+  // A conversation capability acts for one user and never administers the
+  // workspace catalog.
+  orgRoleModel: "organization",
+  orgRole: "member",
 });
 
 export const makeSparkMcpCapabilityVerifier = (config: CloudflareConfig) => {

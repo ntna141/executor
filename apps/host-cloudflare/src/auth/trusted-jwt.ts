@@ -18,6 +18,10 @@ export const principalFromTrustedJwtClaims = (
   const organizationId =
     optionalString(claims[config.trustedJwtOrganizationClaim]) ?? config.organizationId;
   if (!accountId || typeof claims.exp !== "number") return null;
+  // Spark signs `role: "admin"` only for operator tooling (catalog and OAuth
+  // client administration). Every user-facing token is a plain member, which
+  // the organization role model keeps away from org-owned rows.
+  const isAdmin = claims.role === "admin";
 
   return {
     kind: "member",
@@ -28,7 +32,9 @@ export const principalFromTrustedJwtClaims = (
     email: optionalString(claims.email) ?? "",
     name: optionalString(claims.name),
     avatarUrl: null,
-    roles: ["member"],
+    roles: isAdmin ? ["admin"] : ["member"],
+    orgRoleModel: "organization",
+    orgRole: isAdmin ? "admin" : "member",
   };
 };
 
