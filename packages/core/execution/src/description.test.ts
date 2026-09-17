@@ -9,6 +9,7 @@ import {
   ProviderKey,
   createExecutor,
   definePlugin,
+  tool,
   type CredentialProvider,
 } from "@executor-js/sdk";
 import { makeTestConfig } from "@executor-js/sdk/testing";
@@ -70,7 +71,54 @@ const slackPlugin = definePlugin(() => ({
 
 const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
 
+// A plugin that contributes a static integration: tools, no connection.
+const staticPlugin = definePlugin(() => ({
+  id: "static-plugin" as const,
+  packageName: "@executor-js/execution/test-static",
+  storage: () => ({}),
+  extension: () => ({}),
+  staticIntegrations: () => [
+    {
+      id: "spark",
+      kind: "spark",
+      name: "Spark",
+      canRemove: false,
+      canRefresh: false,
+      tools: [
+        tool({
+          name: "ping",
+          description: "Ping.",
+          execute: () => Effect.succeed({ ok: true }),
+        }),
+      ],
+    },
+  ],
+}))();
+
 describe("buildExecuteDescription", () => {
+  it.effect("lists static integrations alongside connected ones, never the executor built-in", () =>
+    Effect.gen(function* () {
+      const executor = yield* createExecutor(
+        makeTestConfig({ plugins: [githubPlugin, staticPlugin] as const }),
+      );
+      yield* executor["github-plugin"].seed();
+      yield* executor.connections.create({
+        owner: "user",
+        name: ConnectionName.make("personal"),
+        integration: GITHUB,
+        template: TEMPLATE,
+        value: "user-token",
+      });
+
+      const description = yield* buildExecuteDescription(executor);
+
+      expect(description).toContain("- `github`");
+      expect(description).toContain("- `spark`");
+      expect(description).not.toContain("- `executor`");
+      expect(parseIntegrationInventory(description)).toEqual(["github", "spark"]);
+    }),
+  );
+
   it.effect("lists the connected integrations, not the connection prefixes", () =>
     Effect.gen(function* () {
       const executor = yield* createExecutor(

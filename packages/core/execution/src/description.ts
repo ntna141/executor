@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import type { Connection, Executor } from "@executor-js/sdk/core";
+import type { Connection, Executor, Tool } from "@executor-js/sdk/core";
 
 /**
  * Builds the `execute` tool description dynamically.
@@ -10,7 +10,9 @@ import type { Connection, Executor } from "@executor-js/sdk/core";
  *      description small)
  *   2. Available integrations (the live, per-session inventory): the top-level
  *      integration slugs the user has connected, deduped across connections,
- *      names only. The same block is appended to the `execute` skill content.
+ *      plus any static integrations a plugin contributes (callable with no
+ *      connection), names only. The same block is appended to the `execute`
+ *      skill content.
  */
 
 /** The header that opens the live integration inventory. Exported so the host
@@ -24,6 +26,14 @@ export const buildExecuteDescription = (executor: Executor): Effect.Effect<strin
       Effect.orDie,
       Effect.withSpan("executor.connections.list"),
     );
+    // Static integrations have tools but no connection row, so the connection
+    // list alone would hide them from the model. They are recognized by their
+    // tools' `static` flag, the one marker only plugin-contributed tools carry.
+    const tools: readonly Tool[] = yield* executor.tools.list().pipe(
+      // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: same channel as the connections read above
+      Effect.orDie,
+      Effect.withSpan("executor.tools.list"),
+    );
 
     const description = yield* Effect.sync(() => {
       const lines = [
@@ -31,7 +41,7 @@ export const buildExecuteDescription = (executor: Executor): Effect.Effect<strin
         "",
         'Before writing code, call `skills({ name: "execute" })` for the workflow on how to use this tool.',
       ];
-      const inventory = formatIntegrationInventory(connections);
+      const inventory = formatIntegrationInventory(connections, staticIntegrationSlugs(tools));
       if (inventory.length > 0) {
         lines.push("");
         lines.push(inventory);
@@ -96,10 +106,30 @@ export const parseIntegrationInventory = (description: string): readonly string[
   return slugs;
 };
 
-const formatIntegrationInventory = (connections: readonly Connection[]): string => {
-  const slugs = [...new Set(connections.map((connection) => String(connection.integration)))].sort(
-    (a, b) => a.localeCompare(b),
-  );
+/** The executor's own built-in integration; its tools are documented by the
+ *  `execute` skill, not listed as an integration. */
+const EXECUTOR_BUILT_IN_SLUG = "executor";
+
+/** Static integrations: contributed by a plugin, callable with no connection.
+ *  Everything else is reached through a connection and listed from that side. */
+const staticIntegrationSlugs = (tools: readonly Tool[]): readonly string[] => [
+  ...new Set(
+    tools
+      .filter((tool) => tool.static === true && String(tool.integration) !== EXECUTOR_BUILT_IN_SLUG)
+      .map((tool) => String(tool.integration)),
+  ),
+];
+
+const formatIntegrationInventory = (
+  connections: readonly Connection[],
+  staticSlugs: readonly string[] = [],
+): string => {
+  const slugs = [
+    ...new Set([
+      ...connections.map((connection) => String(connection.integration)),
+      ...staticSlugs,
+    ]),
+  ].sort((a, b) => a.localeCompare(b));
   if (slugs.length === 0) return "";
   const shown = slugs.slice(0, INVENTORY_LIMIT);
   const lines = [
