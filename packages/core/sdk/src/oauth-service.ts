@@ -17,6 +17,7 @@
 import { Duration, Effect, Exit, Layer, Match, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 
+import { sha256Hex } from "./blob";
 import { connectionIdentifier } from "./connection-name-identifier";
 import type { Connection } from "./connection";
 import type { OrgWriteDeniedError } from "./errors";
@@ -1804,6 +1805,21 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             })()
           : dedupeScopes(scopePolicy.scopes);
 
+      yield* Effect.logInfo("executor oauth start resolved").pipe(
+        Effect.annotateLogs({
+          "executor.integration": String(input.integration),
+          "executor.connection.owner": input.owner,
+          "executor.connection.requested_name": String(requestedName),
+          "executor.connection.resolved_name": String(name),
+          "executor.oauth.client": String(input.client),
+          "executor.oauth.client_owner": input.clientOwner,
+          "executor.oauth.client_first_party": firstPartyFlow,
+          "executor.oauth.grant": client.grant,
+          "executor.oauth.new_connection": input.newConnection === true,
+          "executor.oauth.requested_scopes": requestedScopes.join(" "),
+        }),
+      );
+
       // An explicitly scope-limited first-party app is an authorization
       // boundary, not picker decoration. Endpoint matching and provider
       // discovery can surface capabilities outside the registered app, so
@@ -2135,6 +2151,17 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           }),
       });
 
+      yield* Effect.logInfo("executor oauth browser authorization required").pipe(
+        Effect.annotateLogs({
+          "executor.integration": String(input.integration),
+          "executor.connection.owner": input.owner,
+          "executor.connection.name": String(name),
+          "executor.oauth.client": String(input.client),
+          "executor.oauth.authorization_scopes": completeAuthorizationScopes.join(" "),
+          "executor.oauth.optional_scopes": workspaceOptionalScopes.join(" "),
+        }),
+      );
+
       return { status: "redirect", authorizationUrl, state } as const;
     });
 
@@ -2386,6 +2413,22 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         client.grant === "authorization_code"
           ? missingGrantedOAuthScopes(requestedScopes, oauthScope)
           : [];
+      const accessTokenFingerprint = (yield* sha256Hex(token.access_token)).slice(0, 12);
+      yield* Effect.logInfo("executor oauth grant received").pipe(
+        Effect.annotateLogs({
+          "executor.integration": String(target.integration),
+          "executor.connection.owner": target.owner,
+          "executor.connection.name": String(target.name),
+          "executor.oauth.requested_scopes": requestedScopes.join(" "),
+          "executor.oauth.granted_scopes": oauthScope ?? "",
+          "executor.oauth.missing_scopes": missingScopes.join(" "),
+          "executor.oauth.has_refresh_token": token.refresh_token !== undefined,
+          "executor.oauth.has_advertised_expiry": typeof token.expires_in === "number",
+          "executor.oauth.access_token_fingerprint": accessTokenFingerprint,
+          "executor.oauth.access_token_length": token.access_token.length,
+          "executor.oauth.access_token_type": token.access_token.split("-", 1)[0] ?? "unknown",
+        }),
+      );
       // The freshness facts of this connection AT BIRTH, on the enclosing
       // span (executor.oauth.complete, or the reconnect path's request
       // envelope). Every "why did this connection later go stale" question

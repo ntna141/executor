@@ -15,6 +15,7 @@ import {
   pathNamesASecret,
   projectResponseFields,
   REDACTED_SAMPLE_VALUE,
+  sha256Hex,
   type HealthCheckCandidate,
   type HealthCheckResponseField,
   type HealthCheckResult,
@@ -646,6 +647,69 @@ const recordUpstreamUnreachable = (integration: string, error: OpenApiInvocation
   );
 };
 
+const diagnosticString = (value: unknown, pattern: RegExp, maxLength: number): string | undefined =>
+  typeof value === "string" && value.length <= maxLength && pattern.test(value) ? value : undefined;
+
+const applicationErrorDiagnostics = (
+  value: unknown,
+): { readonly error: string; readonly needed?: string; readonly provided?: string } | null => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const body = value as Record<string, unknown>;
+  if (body.ok !== false) return null;
+  const error = diagnosticString(body.error, /^[a-zA-Z0-9_.:-]+$/, 128);
+  if (error === undefined) return null;
+  const scopePattern = /^[a-zA-Z0-9_:./* -]+$/;
+  const needed = diagnosticString(body.needed, scopePattern, 1024);
+  const provided = diagnosticString(body.provided, scopePattern, 1024);
+  return { error, ...(needed ? { needed } : {}), ...(provided ? { provided } : {}) };
+};
+
+const authorizationValue = (headers: Readonly<Record<string, string>>): string | null => {
+  const header = Object.entries(headers).find(([name]) => name.toLowerCase() === "authorization");
+  if (!header) return null;
+  const value = header[1].trim();
+  const separator = value.indexOf(" ");
+  return separator === -1 ? value : value.slice(separator + 1).trim();
+};
+
+const authorizationScheme = (headers: Readonly<Record<string, string>>): string => {
+  const header = Object.entries(headers).find(([name]) => name.toLowerCase() === "authorization");
+  if (!header) return "none";
+  const value = header[1].trim();
+  const separator = value.indexOf(" ");
+  return separator === -1 ? "none" : value.slice(0, separator);
+};
+
+const recordOpenApiAuthenticationFailure = (input: {
+  readonly integration: string;
+  readonly tool: string;
+  readonly owner: "org" | "user";
+  readonly connection: string;
+  readonly code: string;
+  readonly status?: number;
+  readonly grantedScopes?: readonly string[];
+  readonly requiredScopes?: string;
+  readonly upstreamError?: string;
+}) => {
+  const annotations = {
+    "plugin.openapi.integration": input.integration,
+    "plugin.openapi.tool": input.tool,
+    "executor.connection.owner": input.owner,
+    "executor.connection.name": input.connection,
+    "executor.tool.error_code": input.code,
+    ...(input.status !== undefined ? { "http.status_code": input.status } : {}),
+    ...(input.grantedScopes !== undefined
+      ? { "executor.oauth.granted_scopes": input.grantedScopes.join(" ") }
+      : {}),
+    ...(input.requiredScopes ? { "executor.oauth.required_scopes": input.requiredScopes } : {}),
+    ...(input.upstreamError ? { "plugin.openapi.upstream.error": input.upstreamError } : {}),
+  };
+  return Effect.logWarning("OpenAPI authentication failure").pipe(
+    Effect.annotateLogs(annotations),
+    Effect.andThen(Effect.annotateCurrentSpan(annotations)),
+  );
+};
+
 export const invokeOpenApiBackedTool = (input: {
   readonly ctx: PluginCtx<OpenapiStore>;
   readonly toolRow: { readonly integration: string; readonly name: string };
@@ -700,6 +764,15 @@ export const invokeOpenApiBackedTool = (input: {
         return value == null || value === "";
       });
       if (missing.length > 0) {
+        yield* recordOpenApiAuthenticationFailure({
+          integration,
+          tool: input.toolRow.name,
+          owner: input.credential.owner,
+          connection: String(input.credential.connection),
+          code:
+            template.kind === "oauth2" ? "oauth_connection_missing" : "connection_value_missing",
+          grantedScopes: input.credential.grantedScopes,
+        });
         return openApiAuthToolFailure({
           code:
             template.kind === "oauth2" ? "oauth_connection_missing" : "connection_value_missing",
@@ -713,6 +786,32 @@ export const invokeOpenApiBackedTool = (input: {
       const rendered = renderAuthTemplate(template, input.credential.values);
       Object.assign(headers, rendered.headers);
       Object.assign(queryParams, rendered.queryParams);
+    }
+
+    let slackRequestAuthentication: Record<string, string | number> = {};
+    if (integration === "slack") {
+      const credential = input.credential.value;
+      const authorization = authorizationValue(headers);
+      slackRequestAuthentication = {
+        "executor.credential.fingerprint":
+          credential === null ? "null" : (yield* sha256Hex(credential)).slice(0, 12),
+        "executor.credential.length": credential?.length ?? 0,
+        "executor.request.authorization.scheme": authorizationScheme(headers),
+        "executor.request.authorization.fingerprint":
+          authorization === null ? "null" : (yield* sha256Hex(authorization)).slice(0, 12),
+        "executor.request.authorization.length": authorization?.length ?? 0,
+      };
+      yield* Effect.logInfo("OpenAPI Slack request authentication resolved").pipe(
+        Effect.annotateLogs({
+          "plugin.openapi.integration": integration,
+          "plugin.openapi.tool": input.toolRow.name,
+          "plugin.openapi.method": binding.method.toUpperCase(),
+          "plugin.openapi.path_template": binding.pathTemplate,
+          "executor.connection.owner": input.credential.owner,
+          "executor.connection.name": String(input.credential.connection),
+          ...slackRequestAuthentication,
+        }),
+      );
     }
 
     const invocation = yield* invokeWithLayer(
@@ -798,6 +897,16 @@ export const invokeOpenApiBackedTool = (input: {
                   .map((alternative) => alternative.join(" "))
                   .join(", or ");
           const granted = input.credential.grantedScopes;
+          yield* recordOpenApiAuthenticationFailure({
+            integration,
+            tool: input.toolRow.name,
+            owner: input.credential.owner,
+            connection: String(input.credential.connection),
+            code: "oauth_scope_insufficient",
+            status: result.status,
+            grantedScopes: granted,
+            requiredScopes: required,
+          });
           return openApiAuthToolFailure({
             code: "oauth_scope_insufficient",
             status: result.status,
@@ -810,6 +919,16 @@ export const invokeOpenApiBackedTool = (input: {
             details: result.error,
           });
         }
+        yield* recordOpenApiAuthenticationFailure({
+          integration,
+          tool: input.toolRow.name,
+          owner: input.credential.owner,
+          connection: String(input.credential.connection),
+          code: "connection_rejected",
+          status: result.status,
+          grantedScopes: input.credential.grantedScopes,
+          upstreamError: applicationErrorDiagnostics(result.error)?.error,
+        });
         return openApiAuthToolFailure({
           code: "connection_rejected",
           status: result.status,
@@ -828,6 +947,32 @@ export const invokeOpenApiBackedTool = (input: {
         message: extractOpenApiUpstreamMessage(result.error, result.status),
         details: result.error,
       });
+    }
+    const applicationError = applicationErrorDiagnostics(result.data);
+    if (applicationError) {
+      yield* Effect.logWarning("OpenAPI upstream returned an application error").pipe(
+        Effect.annotateLogs({
+          "plugin.openapi.integration": integration,
+          "plugin.openapi.tool": input.toolRow.name,
+          "executor.connection.owner": input.credential.owner,
+          "executor.connection.name": String(input.credential.connection),
+          "http.status_code": result.status,
+          "plugin.openapi.upstream.error": applicationError.error,
+          ...(applicationError.needed
+            ? { "plugin.openapi.upstream.needed": applicationError.needed }
+            : {}),
+          ...(applicationError.provided
+            ? { "plugin.openapi.upstream.provided": applicationError.provided }
+            : {}),
+          ...(input.credential.grantedScopes !== undefined
+            ? { "executor.oauth.granted_scopes": input.credential.grantedScopes.join(" ") }
+            : {}),
+          ...(result.headers["x-slack-req-id"]
+            ? { "plugin.openapi.upstream.request_id": result.headers["x-slack-req-id"] }
+            : {}),
+          ...slackRequestAuthentication,
+        }),
+      );
     }
     return ToolResult.ok(result.data, {
       http: { status: result.status, headers: result.headers },

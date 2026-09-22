@@ -1,5 +1,9 @@
 import { Effect, Schema } from "effect";
 import { afterEach, describe, expect, it } from "@effect/vitest";
+import { createExecutor } from "@executor-js/sdk";
+import { makeTestConfig } from "@executor-js/sdk/testing";
+import { createExecutionEngine, formatPausedExecution } from "@executor-js/execution";
+import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
 
 import {
   loadedSparkTools,
@@ -158,6 +162,80 @@ describe("sparkToolsPlugin", () => {
           url: "https://linear.test/authorize",
         }),
       ]);
+    }),
+  );
+
+  it.effect("pauses executeWithPause as a url interaction when Spark returns a url result", () =>
+    Effect.gen(function* () {
+      const plugin = sparkToolsPlugin({
+        origin,
+        definitions,
+        fetch: async () =>
+          Response.json({
+            kind: "url",
+            message: "Authorize granola to continue.",
+            url: "https://mcp-auth.granola.ai/authorize?x=1",
+          }),
+      });
+      const executor = yield* createExecutor(makeTestConfig({ plugins: [plugin] as const }));
+      const engine = createExecutionEngine({
+        executor,
+        codeExecutor: {
+          execute: (_code, toolInvoker) =>
+            toolInvoker.invoke({ path: "spark.create_note", args: { title: "Hello" } }).pipe(
+              Effect.map((result) => ({ result, error: undefined })),
+            ),
+        },
+      });
+
+      const outcome = yield* engine.executeWithPause("ignored");
+      expect(outcome.status).toBe("paused");
+      if (outcome.status !== "paused") return;
+      expect(outcome.execution.elicitationContext.request._tag).toBe("UrlElicitation");
+      const formatted = formatPausedExecution(outcome.execution);
+      expect(formatted.structured).toMatchObject({
+        status: "waiting_for_interaction",
+        interaction: {
+          kind: "url",
+          message: "Authorize granola to continue.",
+          url: "https://mcp-auth.granola.ai/authorize?x=1",
+        },
+      });
+    }),
+  );
+
+  it.effect("pauses QuickJS execute of a static spark tool that raises a url result", () =>
+    Effect.gen(function* () {
+      const plugin = sparkToolsPlugin({
+        origin,
+        definitions,
+        fetch: async () =>
+          Response.json({
+            kind: "url",
+            message: "Authorize granola to continue.",
+            url: "https://mcp-auth.granola.ai/authorize?x=1",
+          }),
+      });
+      const executor = yield* createExecutor(makeTestConfig({ plugins: [plugin] as const }));
+      const engine = createExecutionEngine({
+        executor,
+        codeExecutor: makeQuickJsExecutor(),
+      });
+
+      const outcome = yield* engine.executeWithPause(
+        "return await tools.spark.create_note({ title: 'Hello' });",
+      );
+      expect(outcome.status).toBe("paused");
+      if (outcome.status !== "paused") return;
+      expect(outcome.execution.elicitationContext.request._tag).toBe("UrlElicitation");
+      const formatted = formatPausedExecution(outcome.execution);
+      expect(formatted.structured).toMatchObject({
+        status: "waiting_for_interaction",
+        interaction: {
+          kind: "url",
+          url: "https://mcp-auth.granola.ai/authorize?x=1",
+        },
+      });
     }),
   );
 

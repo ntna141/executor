@@ -325,17 +325,34 @@ export const makeExecutorToolInvoker = (
     });
 
     const address = pathToAddress(path);
+    yield* Effect.logInfo("executor tool dispatch started").pipe(
+      Effect.annotateLogs({
+        "mcp.tool.name": path,
+        "mcp.tool.integration": extractNamespace(path),
+      }),
+    );
     const result = yield* executor.execute(address, args, options.invokeOptions).pipe(
-      Effect.catchTag("CredentialResolutionError", (err) =>
-        Effect.succeed(
-          credentialResolutionToolFailure({
-            label: `${err.integration}.${err.owner}.${err.name}`,
-            message: err.message,
-            reauthRequired: err.reauthRequired,
-            oauthErrorCode: err.oauthErrorCode,
+      Effect.catchTag("CredentialResolutionError", (err) => {
+        const failure = credentialResolutionToolFailure({
+          label: `${err.integration}.${err.owner}.${err.name}`,
+          message: err.message,
+          reauthRequired: err.reauthRequired,
+          oauthErrorCode: err.oauthErrorCode,
+        });
+        return Effect.logWarning("executor credential resolution failed").pipe(
+          Effect.annotateLogs({
+            "mcp.tool.name": path,
+            "executor.integration": String(err.integration),
+            "executor.connection.owner": err.owner,
+            "executor.connection.name": String(err.name),
+            "executor.oauth.reauth_required": err.reauthRequired,
+            ...(err.oauthErrorCode !== undefined
+              ? { "executor.oauth.error_code": err.oauthErrorCode }
+              : {}),
           }),
-        ),
-      ),
+          Effect.as(failure),
+        );
+      }),
       Effect.catchCause((cause) => {
         const err = cause.reasons.find(Cause.isFailReason)?.error;
         const expected = expectedToolFailure(err);
@@ -382,6 +399,25 @@ export const makeExecutorToolInvoker = (
     // outcome annotation the dispatch span reads as healthy even when the
     // caller hit an upstream error or auth wall.
     yield* annotateToolResultOutcome(result);
+    const failed = isToolResult(result) && !result.ok;
+    const outcomeLog = failed
+      ? Effect.logWarning("executor tool dispatch finished")
+      : Effect.logInfo("executor tool dispatch finished");
+    yield* outcomeLog.pipe(
+      Effect.annotateLogs({
+        "mcp.tool.name": path,
+        "mcp.tool.integration": extractNamespace(path),
+        "executor.tool.outcome": failed ? "fail" : "ok",
+        ...(failed
+          ? {
+              "executor.tool.error_code": result.error.code,
+              ...(result.error.status !== undefined
+                ? { "executor.tool.error_status": result.error.status }
+                : {}),
+            }
+          : {}),
+      }),
+    );
     const connectedToolPath = parseToolAddress(String(address))
       ? addressToPath(String(address))
       : undefined;

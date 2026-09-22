@@ -75,6 +75,7 @@ import {
   SpecOverridesSchema,
   type SpecOverrides,
 } from "./spec-overrides";
+import { normalizeSlackSpec } from "./normalize-slack-spec";
 
 const encodeJsonText = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
 
@@ -678,6 +679,20 @@ export const openApiPlugin = definePlugin<
     } satisfies ResolvedSpec;
   });
 
+  const normalizeResolvedSpec = Effect.fn("OpenApi.normalizeResolvedSpec")(function* (
+    resolved: ResolvedSpec,
+    integration: string,
+  ) {
+    if (integration !== "slack") return resolved;
+    const document = yield* parseSpecObject(resolved.specText);
+    const normalized = normalizeSlackSpec(document);
+    return {
+      ...resolved,
+      document: normalized,
+      specText: encodeJsonText(normalized),
+    } satisfies ResolvedSpec;
+  });
+
   const resolveSpecForInput = (
     config: Pick<
       OpenApiSpecConfig,
@@ -810,18 +825,15 @@ export const openApiPlugin = definePlugin<
           yield* ctx.core.integrations.authorizeWrite();
           // Resolve URL → text and parse BEFORE opening a transaction. Holding
           // `BEGIN` across a network fetch is the Hyperdrive deadlock path.
-          const resolved = yield* resolveSpecForInput(config, httpClientLayer);
-          const compiled = resolved.keepPathItem
-            ? undefined
-            : yield* compileOpenApiSpec(resolved.specText);
+          const sourceResolved = yield* resolveSpecForInput(config, httpClientLayer);
           const adapter = yield* resolveSpecFormatAdapter(
             options?.specFormats ?? [],
             config.specFormat,
             config.spec.kind === "url" ? config.spec.url : undefined,
           );
           const derivedIdentity =
-            adapter?.deriveIdentity && resolved.document
-              ? adapter.deriveIdentity(resolved.document)
+            adapter?.deriveIdentity && sourceResolved.document
+              ? adapter.deriveIdentity(sourceResolved.document)
               : null;
           const resolvedSlug = config.slug?.trim() || derivedIdentity?.slug;
           if (!resolvedSlug) {
@@ -829,6 +841,10 @@ export const openApiPlugin = definePlugin<
               message: "OpenAPI integration slug is required",
             });
           }
+          const resolved = yield* normalizeResolvedSpec(sourceResolved, resolvedSlug);
+          const compiled = resolved.keepPathItem
+            ? undefined
+            : yield* compileOpenApiSpec(resolved.specText);
 
           // Defaults the add page derives from its preview, applied here so
           // headless callers (MCP, API) get the same integration the UI's
@@ -1025,7 +1041,7 @@ export const openApiPlugin = definePlugin<
 
           // Resolve + compile BEFORE the transaction (same Hyperdrive-deadlock
           // rule as addSpec: never hold BEGIN across a network fetch).
-          const resolved = yield* resolveSpecForInput(
+          const sourceResolved = yield* resolveSpecForInput(
             {
               spec: specInput,
               specFormat: current.specFormat,
@@ -1037,6 +1053,7 @@ export const openApiPlugin = definePlugin<
             },
             httpClientLayer,
           );
+          const resolved = yield* normalizeResolvedSpec(sourceResolved, rawSlug);
           const compiled = resolved.keepPathItem
             ? undefined
             : yield* compileOpenApiSpec(resolved.specText);

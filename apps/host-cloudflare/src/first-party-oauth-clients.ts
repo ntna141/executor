@@ -14,6 +14,29 @@ export interface FirstPartyOAuthClientEnv {
   readonly FIRST_PARTY_SLACK_CLIENT_SECRET?: string;
 }
 
+export const SLACK_USER_OAUTH_SCOPES = [
+  "channels:history",
+  "channels:read",
+  "channels:write",
+  "chat:write",
+  "emoji:read",
+  "files:read",
+  "groups:history",
+  "groups:read",
+  "groups:write",
+  "im:history",
+  "im:read",
+  "im:write",
+  "mpim:history",
+  "mpim:read",
+  "mpim:write",
+  "reactions:read",
+  "reactions:write",
+  "search:read",
+  "users:read",
+  "users:read.email",
+] as const;
+
 const client = (
   clientId: string | undefined,
   clientSecret: string | undefined,
@@ -36,5 +59,6 @@ export const firstPartyOAuthClientsFromEnv = (
     authorizationUrl: "https://slack.com/oauth/v2_user/authorize",
     tokenUrl: "https://slack.com/api/oauth.v2.user.access",
     integrations: [IntegrationSlug.make("slack")],
+    allowedScopes: SLACK_USER_OAUTH_SCOPES,
   }),
 ];

@@ -5,8 +5,10 @@ import {
   AuthTemplateSlug,
   ConnectionName,
   ElicitationResponse,
+  ElicitationId,
   FormElicitation,
   IntegrationSlug,
+  UrlElicitation,
   OAuthClientSlug,
   OAuthRegisterDynamicError,
   ProviderItemId,
@@ -1666,6 +1668,23 @@ const apiPlugin = makeTestPlugin({
           return { ok: true, response: r };
         }),
     },
+    {
+      name: "urlApproval",
+      description: "A tool that raises a URL elicitation and then returns.",
+      inputJsonSchema: EmptyInputJson,
+      validator: EmptyValidator,
+      handler: ({ elicit }) =>
+        Effect.gen(function* () {
+          const r = yield* elicit(
+            UrlElicitation.make({
+              message: "Authorize granola",
+              url: "https://example.com/oauth",
+              elicitationId: ElicitationId.make("elic-url-1"),
+            }),
+          );
+          return { ok: true, response: r };
+        }),
+    },
   ],
 });
 
@@ -1806,6 +1825,26 @@ describe("pause/resume with multiple elicitations", () => {
         const completed = retry as Extract<NonNullable<typeof retry>, { status: "completed" }>;
         expect(completed.result.error).toBeUndefined();
         expect(completed.result.result).toMatchObject({ ok: true });
+      }),
+    { timeout: 10000 },
+  );
+
+  it.effect(
+    "executeWithPause returns a url elicitation as a paused execution",
+    () =>
+      Effect.gen(function* () {
+        const executor = yield* makeElicitingExecutor();
+        const engine = createExecutionEngine({ executor, codeExecutor });
+        const code = "return await tools.api.org.main.urlApproval({});";
+
+        const outcome = yield* engine.executeWithPause(code);
+        expect(outcome.status).toBe("paused");
+        if (outcome.status !== "paused") return;
+        expect(outcome.execution.elicitationContext.request._tag).toBe("UrlElicitation");
+        expect(outcome.execution.elicitationContext.request).toMatchObject({
+          message: "Authorize granola",
+          url: "https://example.com/oauth",
+        });
       }),
     { timeout: 10000 },
   );

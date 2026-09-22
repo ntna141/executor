@@ -31,7 +31,13 @@ import {
   type FumaTables,
   type StorageFailure,
 } from "./fuma-runtime";
-import { makeFumaBlobStore, pluginBlobStore, type BlobStore, type OwnerPartitions } from "./blob";
+import {
+  makeFumaBlobStore,
+  pluginBlobStore,
+  sha256Hex,
+  type BlobStore,
+  type OwnerPartitions,
+} from "./blob";
 import { makePendingApprovalStore, type PendingApprovalStore } from "./pending-approval";
 import { coreToolsPlugin } from "./core-tools";
 import type {
@@ -6595,6 +6601,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const values = yield* Fiber.join(valuesFiber).pipe(
             Effect.onError(() => Fiber.interrupt(integrationRowFiber)),
           );
+          if (String(connectionRow.integration) === "slack") {
+            const value = values[PRIMARY_INPUT_VARIABLE] ?? null;
+            const itemId = connectionItemIds(connectionRow)[PRIMARY_INPUT_VARIABLE] ?? "missing";
+            const write = parseCredentialWriteAttempt(connectionRow.credential_write);
+            yield* Effect.logInfo("executor Slack credential resolved").pipe(
+              Effect.annotateLogs({
+                "executor.tenant": tenant,
+                "executor.subject": subject ?? "org",
+                "executor.connection.owner": connectionRow.owner,
+                "executor.connection.name": connectionRow.name,
+                "executor.credential.provider": connectionRow.provider,
+                "executor.credential.item_id": itemId,
+                "executor.credential.write_runtime_id": write?.runtimeId ?? "legacy",
+                "executor.credential.write_attempt_id": write?.attemptId ?? "legacy",
+                "executor.credential.fingerprint":
+                  value === null ? "null" : (yield* sha256Hex(value)).slice(0, 12),
+                "executor.credential.length": value?.length ?? 0,
+                "executor.credential.token_type": value?.split("-", 1)[0] ?? "none",
+              }),
+            );
+          }
           const integrationRow = yield* Fiber.join(integrationRowFiber);
           // A tool row that outlived its integration (an orphan the catalog no
           // longer lists) is not invokable: its plugin config is gone, and
