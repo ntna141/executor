@@ -4908,7 +4908,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
      *  `updated_at` collides, and the guarded write matches zero rows. What
      *  remains is two NON-sync verdict writers colliding within one SQLite
      *  second — the loser leaves a transiently stale `last_health` that the
-     *  next probe, heal, or read-time revalidation corrects; and a buried
+     *  next probe or read-time revalidation corrects; and a buried
      *  dead grant stays authoritative at read time regardless:
      *  `deadGrantVerdict` answers from `provider_state`, which no verdict
      *  write touches. Best-effort, like every verdict write. */
@@ -4916,6 +4916,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       ref: ConnectionRef,
       observed: Pick<ConnectionRow, "updated_at" | "tools_synced_at">,
       result: HealthCheckResult,
+      expectedRowId?: string,
     ): Effect.Effect<void, never> =>
       core
         .updateMany("connection", {
@@ -4924,6 +4925,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               b("owner", "=", String(ref.owner)),
               b("integration", "=", String(ref.integration)),
               b("name", "=", String(ref.name)),
+              ...(expectedRowId === undefined ? [] : [b("row_id", "=", expectedRowId)]),
               b("updated_at", "=", observed.updated_at),
               observed.tools_synced_at == null
                 ? b.isNull("tools_synced_at")
@@ -4932,77 +4934,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           set: { last_health: result, updated_at: new Date() },
         })
         .pipe(Effect.ignore);
-
-    /** Heal-on-use: a successful invocation is stronger evidence about the
-     *  credential than any persisted probe verdict, so flip a stale non-healthy
-     *  verdict back to healthy from real traffic instead of waiting for the
-     *  next probe. Skipped for tool-sync verdicts (a working credential does
-     *  not refute a failed tool sync; only a successful sync clears those) and
-     *  for grants recorded invalid_grant-dead (the call succeeded on the old
-     *  access token's remaining lifetime — reconnect is still required, so a
-     *  healthy verdict would mislead). Best-effort, like every verdict write.
-     *
-     *  `values` is the credential map the successful call actually used. A
-     *  variable resolving to null means its stored credential is GONE, and a
-     *  rendered request simply omits that placement — so an upstream that
-     *  answers unauthenticated returns success without the credential ever
-     *  being exercised. Healing from that evidence would report healthy for a
-     *  connection that needs reconnecting, which is the one verdict such a
-     *  connection must never carry. The probe path refuses for the same
-     *  reason; this closes the invocation-shaped door onto it.
-     *
-     *  `row` was loaded BEFORE the invocation ran, so its verdict may no
-     *  longer be the persisted one: a concurrent refresh discovering
-     *  invalid_grant, or a probe, can write a NEWER verdict while the call is
-     *  in flight, and an unconditional write here would bury it under
-     *  "healthy". So the decision is re-taken against a fresh row, and the
-     *  write itself is compare-and-swapped on that row's `updated_at` +
-     *  `tools_synced_at` stamps (`persistHealthResult`) — a conflicting
-     *  write landing even between the re-read and the UPDATE changes a
-     *  stamp and the heal is a silent no-op. Any newer write is newer
-     *  evidence than this invocation. */
-    const healPersistedHealthOnUse = (
-      row: ConnectionRow,
-      result: unknown,
-      values: Record<string, string | null>,
-    ): Effect.Effect<void> =>
-      Effect.suspend(() => {
-        if (isToolResult(result) && !result.ok) return Effect.void;
-        if (Object.values(values).some((value) => value == null)) return Effect.void;
-        const observed = Option.getOrNull(decodeLastHealth(row.last_health));
-        if (observed === null || observed.status === "healthy" || observed.status === "unknown") {
-          return Effect.void;
-        }
-        if (isToolSyncHealth(observed)) return Effect.void;
-        if (oauthReauthRequiredFromProviderState(row.provider_state) !== null) return Effect.void;
-        const ref: ConnectionRef = {
-          owner: row.owner as Owner,
-          integration: IntegrationSlug.make(row.integration),
-          name: ConnectionName.make(row.name),
-        };
-        return findConnectionRow(ref).pipe(
-          Effect.flatMap((fresh) => {
-            if (fresh === null) return Effect.void;
-            if (oauthReauthRequiredFromProviderState(fresh.provider_state) !== null) {
-              return Effect.void;
-            }
-            const current = Option.getOrNull(decodeLastHealth(fresh.last_health));
-            if (
-              current === null ||
-              current.status !== observed.status ||
-              current.checkedAt !== observed.checkedAt
-            ) {
-              return Effect.void;
-            }
-            return persistHealthResult(ref, fresh, {
-              status: "healthy",
-              checkedAt: Date.now(),
-              detail: "Tool invocation succeeded.",
-            });
-          }),
-          Effect.ignore,
-        );
-      });
 
     const healthFromCredentialResolutionFailure = (
       failure: CredentialResolutionError,
@@ -5121,8 +5052,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           : {}),
       });
 
-    /** Persist a probe verdict unless the grant died while the probe was in
-     *  flight: a concurrent refresh discovering invalid_grant writes the
+    /** Persist a probe or tool-auth verdict unless the grant died while the
+     *  check was in flight: a concurrent refresh discovering invalid_grant writes the
      *  authoritative dead-grant state (with its own `expired` verdict), and a
      *  probe that passed on the old access token's remaining lifetime must
      *  not bury it. The fresh read decides WHETHER to write; the write itself
@@ -5133,12 +5064,16 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const persistProbeHealthResult = (
       ref: ConnectionRef,
       result: HealthCheckResult,
+      expectedRowId?: string,
     ): Effect.Effect<void> =>
       findConnectionRow(ref).pipe(
         Effect.flatMap((fresh) =>
-          fresh === null || oauthReauthRequiredFromProviderState(fresh.provider_state) !== null
+          fresh === null ||
+          (expectedRowId !== undefined &&
+            (!("row_id" in fresh) || fresh.row_id !== expectedRowId)) ||
+          oauthReauthRequiredFromProviderState(fresh.provider_state) !== null
             ? Effect.void
-            : persistHealthResult(ref, fresh, result),
+            : persistHealthResult(ref, fresh, result, expectedRowId),
         ),
         Effect.ignore,
       );
@@ -6673,24 +6608,52 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           // If the retry also fails its result stands, so a genuinely dead grant
           // still surfaces the upstream's own auth failure and its reconnect
           // guidance rather than a masked one.
-          const { result, usedValues } = yield* Effect.gen(function* () {
-            if (!isUnauthorizedToolFailure(first)) return { result: first, usedValues: values };
+          const { result, refreshSucceeded } = yield* Effect.gen(function* () {
+            if (!isUnauthorizedToolFailure(first)) {
+              return { result: first, refreshSucceeded: false };
+            }
             const refreshed = yield* forceRefreshConnectionValues(connectionRow).pipe(
               // A failed re-mint is not this call's failure to report: the upstream
               // already produced an auth failure with recovery guidance, which is
               // strictly more actionable than a refresh-plumbing error. Keep it.
               Effect.catchTag("CredentialResolutionError", () => Effect.succeed(null)),
             );
-            if (!refreshed) return { result: first, usedValues: values };
+            if (!refreshed) return { result: first, refreshSucceeded: false };
             yield* Effect.annotateCurrentSpan({
               "executor.oauth.refresh.retried": true,
             });
             return {
               result: yield* invokeWith(refreshed),
-              usedValues: refreshed,
+              refreshSucceeded: true,
             };
           });
-          yield* healPersistedHealthOnUse(connectionRow, result, usedValues);
+          const rowId = "row_id" in connectionRow ? connectionRow.row_id : null;
+          if (
+            isUnauthorizedToolFailure(result) &&
+            (refreshSucceeded || connectionRow.refresh_item_id === null) &&
+            typeof rowId === "string"
+          ) {
+            // The verdict is a side effect. A slow database write must not
+            // delay the tool result; the host keeps the detached fiber alive.
+            const fiber = yield* Effect.forkDetach(
+              persistProbeHealthResult(
+                {
+                  owner: connectionRow.owner as Owner,
+                  integration: IntegrationSlug.make(connectionRow.integration),
+                  name: ConnectionName.make(connectionRow.name),
+                },
+                {
+                  status: "expired",
+                  checkedAt: Date.now(),
+                  detail: "Tool invocation was rejected by the provider.",
+                },
+                rowId,
+              ),
+            );
+            config.waitUntil?.(
+              new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
+            );
+          }
           return result;
         });
         // Interrupting an already-completed (or already-joined) fiber is a

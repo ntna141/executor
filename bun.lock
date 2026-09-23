@@ -185,6 +185,7 @@
         "@executor-js/plugin-mcp": "workspace:*",
         "@executor-js/plugin-openapi": "workspace:*",
         "@executor-js/plugin-provider-service-split": "workspace:*",
+        "@executor-js/plugin-slack": "workspace:*",
         "@executor-js/plugin-toolkits": "workspace:*",
         "@executor-js/react": "workspace:*",
         "@executor-js/runtime-dynamic-worker": "workspace:*",
@@ -1131,6 +1132,22 @@
         "react",
       ],
     },
+    "packages/plugins/slack": {
+      "name": "@executor-js/plugin-slack",
+      "version": "1.6.8",
+      "dependencies": {
+        "@executor-js/api": "workspace:*",
+        "@executor-js/sdk": "workspace:*",
+        "effect": "catalog:",
+      },
+      "devDependencies": {
+        "@effect/vitest": "catalog:",
+        "bun-types": "catalog:",
+        "tsup": "catalog:",
+        "typescript": "catalog:",
+        "vitest": "catalog:",
+      },
+    },
     "packages/plugins/provider-service-split": {
       "name": "@executor-js/plugin-provider-service-split",
       "version": "0.0.22",
@@ -1864,6 +1881,8 @@
     "@executor-js/plugin-openapi": ["@executor-js/plugin-openapi@workspace:packages/plugins/openapi"],
 
     "@executor-js/plugin-provider-service-split": ["@executor-js/plugin-provider-service-split@workspace:packages/plugins/provider-service-split"],
+
+    "@executor-js/plugin-slack": ["@executor-js/plugin-slack@workspace:packages/plugins/slack"],
 
     "@executor-js/plugin-toolkits": ["@executor-js/plugin-toolkits@workspace:packages/plugins/toolkits"],
 

@@ -2552,12 +2552,8 @@ describe("execute over a connection", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Sticky-verdict repair: agents read `lastHealth` through coreTools
-// connections.list, and nothing else ever re-probes a persisted verdict, so a
-// transient failure used to read as "unhealthy, reconnect" until a human
-// clicked "Check now". These cover the two repair paths: read-time
-// revalidation on the agent list, and heal-on-use from a successful
-// invocation.
+// Agents read `lastHealth` through coreTools connections.list. A stale
+// verdict is revalidated on that read.
 // ---------------------------------------------------------------------------
 
 const CORE_LIST = ToolAddress.make("executor.coreTools.connections.list");
@@ -2575,12 +2571,11 @@ const makeHealthHarness = (options?: {
    *  `counters.probes`, so a Deferred-gated probe lets a test hold every
    *  in-flight health check open and count how many actually started. */
   readonly probe?: Effect.Effect<typeof HealthCheckResult.Type, unknown>;
+  readonly waitUntil?: (promise: Promise<unknown>) => void;
 }) => {
   const counters = { probes: 0, resolves: 0 };
   const hooks = {
-    // Runs inside every invocation before it returns, so a test can interleave
-    // a concurrent write (e.g. a refresh discovering invalid_grant) between the
-    // row load and the heal-on-use decision.
+    // Runs inside every invocation before it returns.
     onInvoke: Effect.void as Effect.Effect<void>,
     // Runs inside every credential-provider read (counted in
     // `counters.resolves`), so a Deferred here holds the credential-only
@@ -2656,9 +2651,11 @@ const makeHealthHarness = (options?: {
     invokeTool: ({ toolRow, credential, args }) =>
       Effect.as(
         hooks.onInvoke,
-        (args as { fail?: boolean }).fail === true
-          ? ToolResult.fail({ code: "upstream_error", message: "boom" })
-          : { ran: toolRow.name, value: credential.value },
+        (args as { fail?: boolean; unauthorized?: boolean }).unauthorized === true
+          ? ToolResult.fail({ code: "connection_rejected", status: 401, message: "Unauthorized" })
+          : (args as { fail?: boolean }).fail === true
+            ? ToolResult.fail({ code: "upstream_error", message: "boom" })
+            : { ran: toolRow.name, value: credential.value },
       ),
     checkHealth: () =>
       Effect.suspend(() => {
@@ -2678,6 +2675,7 @@ const makeHealthHarness = (options?: {
     const config = makeTestConfig({
       plugins: [plugin] as const,
       coreTools: { webBaseUrl: "http://localhost:3000" },
+      waitUntil: options?.waitUntil,
     });
     const executor = yield* createExecutor({ ...config, db: interceptHealthWrites(config.db) });
     yield* executor.healthdemo.seed();
@@ -2950,8 +2948,8 @@ describe("agent read revalidation (coreTools connections.list)", () => {
   );
 });
 
-describe("heal-on-use", () => {
-  it.effect("a successful invocation flips a stale non-healthy verdict to healthy", () =>
+describe("tool invocation health side effects", () => {
+  it.effect("success does not clear a stored auth error", () =>
     Effect.gen(function* () {
       const { executor, stamp, persisted } = yield* makeHealthHarness();
       yield* stamp({
@@ -2961,105 +2959,72 @@ describe("heal-on-use", () => {
       yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
 
       const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({
-        status: "healthy",
-        detail: "Tool invocation succeeded.",
-      });
-    }),
-  );
-
-  it.effect("an explicit tool failure does not heal", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted } = yield* makeHealthHarness();
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
-      });
-
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), { fail: true });
-
-      const row = yield* persisted();
       expect(row?.lastHealth?.status).toBe("expired");
     }),
   );
 
-  it.effect("a grant recorded invalid_grant-dead is not healed by a lingering token", () =>
+  it.effect("returns a 401 before its health write completes", () =>
     Effect.gen(function* () {
-      const { executor, stamp, persisted } = yield* makeHealthHarness();
-      yield* stamp({
-        provider_state: { oauthReauthRequiredAt: Date.now() },
-        last_health: {
-          status: "expired",
-          checkedAt: Date.now() - STALE_MS,
-          detail: "invalid_grant",
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const background: Promise<unknown>[] = [];
+      const { executor, persisted, hooks } = yield* makeHealthHarness({
+        waitUntil: (promise) => {
+          background.push(promise);
         },
       });
+      hooks.beforeHealthPersist = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
 
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
+      const result = yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {
+        unauthorized: true,
+      });
+      expect(result).toMatchObject({ ok: false, error: { status: 401 } });
+      yield* Deferred.await(entered);
+      expect(background).toHaveLength(1);
+      expect((yield* persisted())?.lastHealth).toBeNull();
 
-      const row = yield* persisted();
-      expect(row?.lastHealth?.status).toBe("expired");
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.promise(() => Promise.all(background));
+      expect((yield* persisted())?.lastHealth?.status).toBe("expired");
     }),
   );
 
-  it.effect("does not overwrite a newer verdict written while the call was in flight", () =>
+  it.effect("does not mark a replacement connection expired", () =>
     Effect.gen(function* () {
-      const { executor, stamp, persisted, hooks } = yield* makeHealthHarness();
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const background: Promise<unknown>[] = [];
+      const { executor, persisted, hooks } = yield* makeHealthHarness({
+        waitUntil: (promise) => {
+          background.push(promise);
+        },
       });
-      // A probe (or refresh) lands a NEWER expired verdict while the call is
-      // in flight. Heal-on-use decided from the row loaded BEFORE invocation;
-      // it must re-check at write time and leave the newer evidence standing.
-      const newerDetail = "revoked upstream while the call ran";
-      hooks.onInvoke = stamp({
-        last_health: { status: "expired", checkedAt: Date.now(), detail: newerDetail },
-      }).pipe(Effect.asVoid);
+      hooks.beforeHealthPersist = Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+      );
 
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
-
-      const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({ status: "expired", detail: newerDetail });
-    }),
-  );
-
-  it.effect("does not resurrect a grant that died while the call was in flight", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted, hooks } = yield* makeHealthHarness();
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
+      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {
+        unauthorized: true,
       });
-      // A concurrent refresh discovers invalid_grant mid-call and records the
-      // dead grant. The invocation still succeeded on the old access token's
-      // remaining lifetime — healing from it would bury the reconnect.
-      hooks.onInvoke = stamp({
-        provider_state: { oauthReauthRequiredAt: Date.now() },
-        last_health: { status: "expired", checkedAt: Date.now(), detail: "invalid_grant" },
-      }).pipe(Effect.asVoid);
-
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
-
-      const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({ status: "expired", detail: "invalid_grant" });
-    }),
-  );
-
-  it.effect("a call whose credential no longer resolves is not healed", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted } = yield* makeHealthHarness();
-      // The stored credential is gone from the provider. Rendering skips a
-      // missing placement, so an upstream that answers unauthenticated still
-      // succeeds — that success says nothing about a credential that no longer
-      // exists, and healing from it would tell the user to stop reconnecting.
-      yield* stamp({
-        item_ids: { token: "vanished-item" },
-        credential_write: null,
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
+      yield* Deferred.await(entered);
+      yield* executor.connections.remove({
+        owner: "org",
+        integration: INTEG,
+        name: ConnectionName.make("main"),
+      });
+      yield* executor.connections.create({
+        owner: "org",
+        name: ConnectionName.make("main"),
+        integration: INTEG,
+        template: TEMPLATE,
+        value: "new-secret",
       });
 
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
-
-      const row = yield* persisted();
-      expect(row?.lastHealth?.status).toBe("expired");
+      yield* Deferred.succeed(release, undefined);
+      yield* Effect.promise(() => Promise.all(background));
+      expect((yield* persisted())?.lastHealth).toBeNull();
     }),
   );
 });
@@ -3116,51 +3081,8 @@ describe("verdict write guards close the check-to-write window", () => {
     }),
   );
 
-  it.effect("heal-on-use: a dead grant recorded inside the window survives", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted, hooks } = yield* makeHealthHarness();
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
-        updated_at: new Date(Date.now() - STALE_MS),
-      });
-      // Heal-on-use re-reads, sees the stale verdict it observed at load and
-      // no dead grant, and decides to heal — then the dead-grant write
-      // commits before its UPDATE.
-      hooks.beforeHealthPersist = stamp({
-        provider_state: { oauthReauthRequiredAt: Date.now() },
-        last_health: { status: "expired", checkedAt: Date.now(), detail: "invalid_grant" },
-        updated_at: new Date(),
-      }).pipe(Effect.asVoid);
-
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
-
-      const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({ status: "expired", detail: "invalid_grant" });
-    }),
-  );
-
-  it.effect("heal-on-use: a newer verdict written inside the window survives", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted, hooks } = yield* makeHealthHarness();
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
-        updated_at: new Date(Date.now() - STALE_MS),
-      });
-      const newerDetail = "revoked upstream while the heal was in flight";
-      hooks.beforeHealthPersist = stamp({
-        last_health: { status: "expired", checkedAt: Date.now(), detail: newerDetail },
-        updated_at: new Date(),
-      }).pipe(Effect.asVoid);
-
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
-
-      const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({ status: "expired", detail: newerDetail });
-    }),
-  );
-
-  // The three tests above age `updated_at` so the conflict's bump lands in a
-  // different SQLite second granule. The three below do the opposite: the
+  // The tests above age `updated_at` so the conflict's bump lands in a
+  // different SQLite second granule. The tests below do the opposite: the
   // conflict reuses the EXACT stamp the guard's fresh read observed — the
   // same-second collision `updated_at` alone cannot see — so only the
   // `tools_synced_at` leg of the swap can refuse the guarded write. The
@@ -3191,36 +3113,6 @@ describe("verdict write guards close the check-to-write window", () => {
       const result = yield* executor.connections.checkHealth(REF);
       expect(result.status).toBe("healthy");
       expect(counters.probes).toBe(1);
-
-      const row = yield* persisted();
-      expect(row?.lastHealth).toMatchObject({ status: "degraded", detail: SYNC_DETAIL });
-      const raw = yield* rawRow();
-      expect(Number(raw?.tools_synced_at)).toBe(freshSyncedAt);
-    }),
-  );
-
-  it.effect("heal-on-use: a failing sync landing in the same second survives", () =>
-    Effect.gen(function* () {
-      const { executor, stamp, persisted, rawRow, hooks } = yield* makeHealthHarness();
-      const observedUpdatedAt = new Date();
-      const observedSyncedAt = Date.now() - STALE_MS;
-      yield* stamp({
-        last_health: { status: "expired", checkedAt: Date.now() - STALE_MS, detail: "HTTP 401" },
-        updated_at: observedUpdatedAt,
-        tools_synced_at: observedSyncedAt,
-      });
-      // `+ 1` rather than `Date.now()`: the invocation itself may re-stamp
-      // `tools_synced_at` before the heal's fresh read, and the conflicting
-      // sync stamp must be guaranteed to differ from whatever that read
-      // observed — an aged value + 1 can match neither it nor "now".
-      const freshSyncedAt = observedSyncedAt + 1;
-      hooks.beforeHealthPersist = stamp({
-        tools_synced_at: freshSyncedAt,
-        last_health: { status: "degraded", checkedAt: Date.now(), detail: SYNC_DETAIL },
-        updated_at: observedUpdatedAt,
-      }).pipe(Effect.asVoid);
-
-      yield* executor.execute(ToolAddress.make("tools.vercel.org.main.deploy"), {});
 
       const row = yield* persisted();
       expect(row?.lastHealth).toMatchObject({ status: "degraded", detail: SYNC_DETAIL });

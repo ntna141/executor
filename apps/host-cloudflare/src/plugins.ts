@@ -10,6 +10,7 @@ import {
 import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { encryptedSecretsPlugin } from "@executor-js/plugin-encrypted-secrets";
+import { slackPlugin } from "@executor-js/plugin-slack";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
 
 import { sparkToolsPlugin, type SparkToolsPluginOptions } from "./spark-tools-plugin";
@@ -45,6 +46,7 @@ export const makeCloudflarePlugins = (
     }),
     mcpHttpPlugin({ dangerouslyAllowStdioMCP: false }),
     graphqlHttpPlugin(),
+    slackPlugin(),
     toolkitsPlugin({ activeToolkitSlug: options.activeToolkitSlug }),
     encryptedSecretsPlugin({ key: secretKey }),
     sparkToolsPlugin(options.sparkTools),

@@ -1,4 +1,7 @@
 import { IntegrationSlug, type FirstPartyOAuthClientConfig } from "@executor-js/sdk";
+import { SLACK_USER_OAUTH_SCOPES } from "@executor-js/plugin-slack";
+
+export { SLACK_USER_OAUTH_SCOPES } from "@executor-js/plugin-slack";
 
 // ---------------------------------------------------------------------------
 // Host-operated OAuth apps. With one tenant per Spark user there is no shared
@@ -13,29 +16,6 @@ export interface FirstPartyOAuthClientEnv {
   readonly FIRST_PARTY_SLACK_CLIENT_ID?: string;
   readonly FIRST_PARTY_SLACK_CLIENT_SECRET?: string;
 }
-
-export const SLACK_USER_OAUTH_SCOPES = [
-  "channels:history",
-  "channels:read",
-  "channels:write",
-  "chat:write",
-  "emoji:read",
-  "files:read",
-  "groups:history",
-  "groups:read",
-  "groups:write",
-  "im:history",
-  "im:read",
-  "im:write",
-  "mpim:history",
-  "mpim:read",
-  "mpim:write",
-  "reactions:read",
-  "reactions:write",
-  "search:read",
-  "users:read",
-  "users:read.email",
-] as const;
 
 const client = (
   clientId: string | undefined,
@@ -52,8 +32,8 @@ export const firstPartyOAuthClientsFromEnv = (
 ): readonly FirstPartyOAuthClientConfig[] => [
   // Slack's hosted MCP server is limited to Marketplace-listed apps, so Spark
   // connects Slack through the Web API instead: the user-token authorize
-  // endpoint mints a user token for whichever workspace the user picks, and the
-  // `slack` integration is an OpenAPI description of the Web API.
+  // endpoint mints a user token for whichever workspace the user picks. The
+  // Slack plugin exposes the curated Web API surface through that connection.
   ...client(env.FIRST_PARTY_SLACK_CLIENT_ID, env.FIRST_PARTY_SLACK_CLIENT_SECRET, {
     name: "slack",
     authorizationUrl: "https://slack.com/oauth/v2_user/authorize",
