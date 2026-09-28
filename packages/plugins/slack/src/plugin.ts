@@ -16,7 +16,7 @@ import {
 } from "@executor-js/sdk/core";
 import { capture } from "@executor-js/api";
 
-import { checkSlackAuth, invokeSlackTool, SlackApiError } from "./client";
+import { checkSlackAuth, invokeSlackTool, SlackApiError, slackToolFailure } from "./client";
 import { SLACK_TOOL_DEFS } from "./tools";
 
 export const SLACK_USER_OAUTH_SCOPES = [
@@ -140,13 +140,20 @@ export const slackPlugin = definePlugin(() => ({
 
   resolveTools: () => Effect.succeed({ tools: SLACK_TOOL_DEFS }),
 
+  // Slack's refusals are expected tool outcomes; returning them as values lets
+  // the caller read Slack's reason instead of an opaque internal error.
   invokeTool: ({ ctx, toolRow, credential, args }) => {
     if (credential.value === null) {
-      return Effect.fail(
-        new SlackApiError({ method: String(toolRow.name), code: "missing_access_token" }),
+      return Effect.succeed(
+        slackToolFailure(
+          new SlackApiError({ method: String(toolRow.name), code: "missing_access_token" }),
+          credential.owner,
+        ),
       );
     }
-    return invokeSlackTool(String(toolRow.name), args, credential.value, ctx.httpClientLayer);
+    return invokeSlackTool(String(toolRow.name), args, credential.value, ctx.httpClientLayer).pipe(
+      Effect.catch((error) => Effect.succeed(slackToolFailure(error, credential.owner))),
+    );
   },
 
   listHealthCheckCandidates: () =>

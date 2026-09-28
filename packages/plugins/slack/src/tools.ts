@@ -41,6 +41,60 @@ const def = (
   ...(annotations ? { annotations } : {}),
 });
 
+const returns = (tool: ToolDef, outputSchema: JsonSchema): ToolDef => ({ ...tool, outputSchema });
+
+const slackMessage = object(
+  {
+    channel_id: string,
+    channel_name: string,
+    ts: string,
+    thread_ts: string,
+    reply_count: integer,
+    user_id: string,
+    user_name: string,
+    text: string,
+    attachments: array(object({ title: string, text: string, url: string }, ["text"])),
+    files: array(object({ id: string, name: string, type: string }, ["id"])),
+    permalink: string,
+    truncated: boolean,
+  },
+  ["channel_id", "ts", "text"],
+);
+
+const messageSearchOutput = object({ messages: array(slackMessage), total: integer }, [
+  "messages",
+  "total",
+]);
+
+const messagePageProperties = {
+  channel_id: string,
+  messages: array(slackMessage),
+  has_more: boolean,
+  next_cursor: string,
+} satisfies Readonly<Record<string, JsonSchema>>;
+
+const userSearchOutput = object(
+  {
+    users: array(
+      object(
+        {
+          id: string,
+          name: string,
+          real_name: string,
+          display_name: string,
+          title: string,
+          email: string,
+          is_bot: boolean,
+          deleted: boolean,
+        },
+        ["id", "name", "is_bot"],
+      ),
+    ),
+    next_cursor: string,
+  },
+  ["users"],
+);
+
 const columnType = enumeration(
   "text",
   "rich_text",
@@ -314,20 +368,23 @@ export const SLACK_TOOL_DEFS: readonly ToolDef[] = [
     "Read a Slack Canvas and return its content and metadata.",
     object({ canvas_id: string }, ["canvas_id"]),
   ),
-  def(
-    "slack_read_channel",
-    "Read Slack channel or direct-message history, newest first.",
-    object(
-      {
-        channel_id: string,
-        cursor: string,
-        latest: string,
-        limit: integer,
-        oldest: string,
-        response_format: string,
-      },
-      ["channel_id"],
+  returns(
+    def(
+      "slack_read_channel",
+      "Read Slack channel or direct-message history, newest first, up to 100 messages per call. For a message with reply_count, pass its channel_id and ts to slack_read_thread to read the replies.",
+      object(
+        {
+          channel_id: string,
+          cursor: string,
+          latest: string,
+          limit: integer,
+          oldest: string,
+          response_format: string,
+        },
+        ["channel_id"],
+      ),
     ),
+    object(messagePageProperties, ["channel_id", "messages", "has_more"]),
   ),
   def("slack_read_file", "Read a Slack file by file ID.", object({ file_id: string }, ["file_id"])),
   def(
@@ -342,21 +399,27 @@ export const SLACK_TOOL_DEFS: readonly ToolDef[] = [
       schema_only: boolean,
     }),
   ),
-  def(
-    "slack_read_thread",
-    "Read a Slack thread, including the parent and replies.",
-    object(
-      {
+  returns(
+    def(
+      "slack_read_thread",
+      "Read a Slack thread, parent first, then replies. Pass channel_id and message_ts (a message's channel_id and ts from search or channel results), or pass the message's permalink.",
+      object({
         channel_id: string,
         cursor: string,
         latest: string,
         limit: integer,
         message_ts: string,
         oldest: string,
+        permalink: string,
         response_format: string,
-      },
-      ["channel_id", "message_ts"],
+      }),
     ),
+    object({ ...messagePageProperties, thread_ts: string }, [
+      "channel_id",
+      "thread_ts",
+      "messages",
+      "has_more",
+    ]),
   ),
   def(
     "slack_read_user_profile",
@@ -397,28 +460,37 @@ export const SLACK_TOOL_DEFS: readonly ToolDef[] = [
     "Search custom Slack emoji names.",
     object({ query: string }, ["query"]),
   ),
-  def(
-    "slack_search_public",
-    "Search messages and files in public Slack channels. Put content words in keywords and Slack modifiers such as from:alice, in:general, after:2026-01-01, and before:2026-02-01 in filters. For the latest result, use sort=timestamp and sort_dir=desc. Use a known Slack username directly; call slack_search_users first only when the person is ambiguous.",
-    object(searchProperties),
+  returns(
+    def(
+      "slack_search_public",
+      "Search messages in public Slack channels, up to 20 per call. Put content words in keywords and Slack modifiers such as from:alice, in:general, after:2026-01-01, and before:2026-02-01 in filters. For the latest result, use sort=timestamp and sort_dir=desc. Use a known Slack username directly; call slack_search_users first only when the person is ambiguous. Message and attachment text is cut to 500 characters; when truncated is true, or to read the thread, pass the result's channel_id and ts, or its permalink, to slack_read_thread.",
+      object(searchProperties),
+    ),
+    messageSearchOutput,
   ),
-  def(
-    "slack_search_public_and_private",
-    "Search messages and files across public channels, private channels, group DMs, and DMs. Put content words in keywords and Slack modifiers such as from:alice, in:general, after:2026-01-01, and before:2026-02-01 in filters. For the latest result, use sort=timestamp and sort_dir=desc. Use a known Slack username directly; call slack_search_users first only when the person is ambiguous.",
-    object({ ...searchProperties, channel_types: string }),
-    approval("Search private Slack conversations"),
+  returns(
+    def(
+      "slack_search_public_and_private",
+      "Search messages across public channels, private channels, group DMs, and DMs, up to 20 per call. Put content words in keywords and Slack modifiers such as from:alice, in:general, after:2026-01-01, and before:2026-02-01 in filters. For the latest result, use sort=timestamp and sort_dir=desc. Use a known Slack username directly; call slack_search_users first only when the person is ambiguous. Message and attachment text is cut to 500 characters; when truncated is true, or to read the thread, pass the result's channel_id and ts, or its permalink, to slack_read_thread.",
+      object({ ...searchProperties, channel_types: string }),
+      approval("Search private Slack conversations"),
+    ),
+    messageSearchOutput,
   ),
-  def(
-    "slack_search_users",
-    "Search Slack users by name, email, and profile attributes. Use this only when a later tool needs a user ID or the requested person is ambiguous; Slack message search accepts from:username directly.",
-    object({
-      cursor: string,
-      keywords: array(string),
-      limit: integer,
-      natural_language_query: string,
-      query: string,
-      response_format: string,
-    }),
+  returns(
+    def(
+      "slack_search_users",
+      "Search Slack users by name, email, and profile attributes, up to 20 per call. Use this only when a later tool needs a user ID or the requested person is ambiguous; Slack message search accepts from:<name> directly.",
+      object({
+        cursor: string,
+        keywords: array(string),
+        limit: integer,
+        natural_language_query: string,
+        query: string,
+        response_format: string,
+      }),
+    ),
+    userSearchOutput,
   ),
   def(
     "slack_send_message",

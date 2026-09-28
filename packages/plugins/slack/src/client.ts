@@ -1,21 +1,98 @@
+import { authToolFailure, ToolResult, type Owner } from "@executor-js/sdk/core";
 import { Data, Effect, Layer, Predicate } from "effect";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 const SLACK_API = "https://slack.com/api/";
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENT_TEXT = 2_000;
+// Search is for finding messages; slack_read_thread returns them in full.
+const SEARCH_SNIPPET_CHARS = 500;
+// Read methods sent as query parameters, as Slack's own SDKs send them.
+// conversations.replies failed with invalid_arguments when sent a JSON body.
+const QUERY_METHODS: ReadonlySet<string> = new Set([
+  "search.all",
+  "conversations.replies",
+  "users.info",
+]);
 
 type Args = Record<string, unknown>;
 type JsonObject = Record<string, unknown>;
 
-export class SlackApiError extends Data.TaggedError("SlackApiError")<{
+type SlackFailure = {
   readonly method: string;
   readonly code: string;
   readonly status?: number;
-}> {
+  /** Slack's `response_metadata.messages`: which argument was wrong and why. */
+  readonly detail?: readonly string[];
+  readonly needed?: string;
+  readonly provided?: string;
+};
+
+const failureText = (failure: SlackFailure): string => {
+  const notes = [
+    ...(failure.detail ?? []),
+    ...(failure.needed ? [`needs the ${failure.needed} scope`] : []),
+  ];
+  const detail = notes.length > 0 ? ` (${notes.join("; ")})` : "";
+  return `Slack ${failure.method} failed: ${failure.code}${detail}`;
+};
+
+export class SlackApiError extends Data.TaggedError("SlackApiError")<SlackFailure> {
   override get message(): string {
-    return `Slack ${this.method} failed: ${this.code}`;
+    return failureText(this);
   }
 }
+
+const REJECTED_TOKEN_CODES: ReadonlySet<string> = new Set([
+  "invalid_auth",
+  "not_authed",
+  "token_revoked",
+  "token_expired",
+  "account_inactive",
+]);
+
+/** Report a Slack failure as a tool result so the caller sees Slack's reason. */
+export const slackToolFailure = (error: SlackApiError, owner: Owner): ToolResult<never> => {
+  const integration = { id: "slack", scope: owner };
+  const upstream = {
+    ...(error.status !== undefined ? { status: error.status } : {}),
+    details: {
+      method: error.method,
+      error: error.code,
+      ...(error.detail ? { messages: error.detail } : {}),
+      ...(error.needed ? { needed: error.needed } : {}),
+      ...(error.provided ? { provided: error.provided } : {}),
+    },
+  };
+  if (error.code === "missing_access_token") {
+    return authToolFailure({
+      code: "oauth_connection_missing",
+      message: "The Slack connection has no access token. Reconnect Slack.",
+      integration,
+      credential: { kind: "oauth" },
+    });
+  }
+  if (REJECTED_TOKEN_CODES.has(error.code)) {
+    return authToolFailure({
+      code: "connection_rejected",
+      message: failureText(error),
+      status: 401,
+      integration,
+      credential: { kind: "oauth" },
+      upstream,
+    });
+  }
+  // A missing scope blocks one method, not the connection, so it stays an
+  // ordinary failure rather than a prompt to reconnect Slack.
+  const rateLimited = error.code === "rate_limited" || error.code === "ratelimited";
+  return ToolResult.fail({
+    code: rateLimited ? "rate_limited" : error.code,
+    message: failureText(error),
+    ...(error.status !== undefined ? { status: error.status } : {}),
+    details: upstream.details,
+    ...(rateLimited || error.code === "transport_error" ? { retryable: true } : {}),
+  });
+};
 
 const asObject = (value: unknown): JsonObject =>
   typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : {};
@@ -45,7 +122,7 @@ const slackCall = Effect.fn("Slack.call")(function* (method: string, body: Args,
   const client = yield* HttpClient.HttpClient;
   const values = compact(body);
   const request = (
-    method === "search.all"
+    QUERY_METHODS.has(method)
       ? HttpClientRequest.get(
           `${SLACK_API}${method}?${new URLSearchParams(
             Object.entries(values).map(([key, value]) => [key, String(value)]),
@@ -77,10 +154,14 @@ const slackCall = Effect.fn("Slack.call")(function* (method: string, body: Args,
     });
   }
   if (payload.ok !== true) {
+    const detail = stringArray(asObject(payload.response_metadata).messages);
     return yield* new SlackApiError({
       method,
       code: typeof payload.error === "string" ? payload.error : "unknown_error",
       status: response.status,
+      ...(detail.length > 0 ? { detail } : {}),
+      ...(typeof payload.needed === "string" ? { needed: payload.needed } : {}),
+      ...(typeof payload.provided === "string" ? { provided: payload.provided } : {}),
     });
   }
   return payload;
@@ -313,6 +394,20 @@ const matchesWords = (value: unknown, words: readonly string[]): boolean => {
   });
 };
 
+const userOutput = (member: JsonObject): JsonObject => {
+  const profile = asObject(member.profile);
+  return compact({
+    id: member.id,
+    name: member.name,
+    real_name: stringValue(member, "real_name") ?? stringValue(profile, "real_name"),
+    display_name: stringValue(profile, "display_name"),
+    title: stringValue(profile, "title"),
+    email: stringValue(profile, "email"),
+    is_bot: member.is_bot === true,
+    deleted: member.deleted === true ? true : undefined,
+  });
+};
+
 const searchUsers = Effect.fn("Slack.searchUsers")(function* (args: Args, token: string) {
   const limit = Math.min(Math.max(numberValue(args, "limit") ?? 20, 1), 20);
   const words = wordsFor(args);
@@ -325,7 +420,10 @@ const searchUsers = Effect.fn("Slack.searchUsers")(function* (args: Args, token:
     cursor = stringValue(asObject(response.response_metadata), "next_cursor");
     if (cursor === undefined) break;
   }
-  return { users: matches.slice(0, limit), next_cursor: cursor ?? null };
+  return {
+    users: matches.slice(0, limit).map(userOutput),
+    ...(cursor === undefined ? {} : { next_cursor: cursor }),
+  };
 });
 
 const searchChannels = Effect.fn("Slack.searchChannels")(function* (args: Args, token: string) {
@@ -364,6 +462,223 @@ const messageChannelId = (match: JsonObject): string | undefined => {
   const channel = asObject(match.channel);
   return typeof channel.id === "string" ? channel.id : undefined;
 };
+
+const permalinkThreadTs = (permalink: string | undefined): string | undefined =>
+  permalink !== undefined && URL.canParse(permalink)
+    ? (new URL(permalink).searchParams.get("thread_ts") ?? undefined)
+    : undefined;
+
+const collectText = (node: unknown, out: string[]): void => {
+  if (Array.isArray(node)) {
+    for (const item of node) collectText(item, out);
+    return;
+  }
+  for (const [key, value] of Object.entries(asObject(node))) {
+    if (key === "accessory") continue;
+    if (key === "text" && typeof value === "string") out.push(value);
+    else collectText(value, out);
+  }
+};
+
+const blockText = (block: JsonObject): string => {
+  if (block.type === "actions") return "";
+  const pieces: string[] = [];
+  collectText(block, pieces);
+  return pieces.join(block.type === "rich_text" ? "" : "\n").trim();
+};
+
+const clip = (text: string, max: number): string =>
+  text.length > max ? `${text.slice(0, max)}…` : text;
+
+type AttachmentOutput = { readonly title?: string; readonly text: string; readonly url?: string };
+
+/** Bot messages (Linear, GitHub, unfurls) carry their content in attachments. */
+const attachmentOutput = (attachment: JsonObject): AttachmentOutput | undefined => {
+  const blocks = Array.isArray(attachment.blocks) ? attachment.blocks.map(asObject) : [];
+  const body = [
+    stringValue(attachment, "pretext"),
+    stringValue(attachment, "text"),
+    ...blocks.map(blockText),
+  ]
+    .filter((part): part is string => part !== undefined && part.length > 0)
+    .join("\n");
+  // A shared message's fallback repeats the whole message, so it is only a
+  // last resort for text, never a title.
+  const title = stringValue(attachment, "title");
+  const text = body.length > 0 ? body : (stringValue(attachment, "fallback") ?? "");
+  if (text.length === 0 && title === undefined) return undefined;
+  const url =
+    stringValue(attachment, "title_link") ??
+    stringValue(attachment, "from_url") ??
+    stringValue(attachment, "original_url");
+  return {
+    ...(title === undefined ? {} : { title }),
+    text: clip(text, MAX_ATTACHMENT_TEXT),
+    ...(url === undefined ? {} : { url }),
+  };
+};
+
+const fileOutput = (file: JsonObject): JsonObject =>
+  compact({
+    id: file.id,
+    name: stringValue(file, "title") ?? stringValue(file, "name"),
+    type: stringValue(file, "filetype"),
+  });
+
+type MessageContext = {
+  readonly channelId?: string;
+  readonly userNames?: ReadonlyMap<string, string>;
+  /** Cut text and attachment text to this length and mark the message truncated. */
+  readonly snippetChars?: number;
+};
+
+/** The fields a caller needs from a Slack message, and the IDs later tools take. */
+const messageOutput = (raw: JsonObject, context: MessageContext): JsonObject => {
+  const channel = asObject(raw.channel);
+  const userId = stringValue(raw, "user");
+  const permalink = stringValue(raw, "permalink");
+  const attachments = (Array.isArray(raw.attachments) ? raw.attachments.map(asObject) : [])
+    .map(attachmentOutput)
+    .filter(Predicate.isNotUndefined);
+  const files = Array.isArray(raw.files) ? raw.files.map(asObject).map(fileOutput) : [];
+  const replyCount = numberValue(raw, "reply_count");
+  const text = typeof raw.text === "string" ? raw.text : "";
+  const limit = context.snippetChars;
+  const truncated =
+    limit !== undefined &&
+    (text.length > limit || attachments.some((attachment) => attachment.text.length > limit));
+  return compact({
+    channel_id: messageChannelId(raw) ?? context.channelId,
+    channel_name: channel.is_im === true ? undefined : stringValue(channel, "name"),
+    ts: stringValue(raw, "ts"),
+    thread_ts: stringValue(raw, "thread_ts") ?? permalinkThreadTs(permalink),
+    reply_count: replyCount !== undefined && replyCount > 0 ? replyCount : undefined,
+    user_id: userId,
+    user_name:
+      stringValue(raw, "username") ??
+      (userId === undefined ? undefined : context.userNames?.get(userId)) ??
+      stringValue(asObject(raw.bot_profile), "name"),
+    text: limit === undefined ? text : clip(text, limit),
+    attachments:
+      attachments.length === 0
+        ? undefined
+        : limit === undefined
+          ? attachments
+          : attachments.map((attachment) => ({
+              ...attachment,
+              text: clip(attachment.text, limit),
+            })),
+    files: files.length > 0 ? files : undefined,
+    permalink,
+    truncated: truncated ? true : undefined,
+  });
+};
+
+/** Slack handles for message authors that history and replies identify only by ID. */
+const authorNames = Effect.fn("Slack.authorNames")(function* (
+  messages: readonly JsonObject[],
+  token: string,
+) {
+  const ids = new Set(
+    messages
+      .filter((message) => stringValue(message, "username") === undefined)
+      .map((message) => stringValue(message, "user"))
+      .filter(Predicate.isNotUndefined),
+  );
+  const entries = yield* Effect.all(
+    [...ids].map((user) =>
+      slackCall("users.info", { user }, token).pipe(
+        Effect.map((info) => [user, stringValue(asObject(info.user), "name")] as const),
+        Effect.catch(() => Effect.succeed([user, undefined] as const)),
+      ),
+    ),
+    { concurrency: 8 },
+  );
+  const names = new Map<string, string>();
+  for (const [user, name] of entries) if (name !== undefined) names.set(user, name);
+  return names;
+});
+
+const messagePage = Effect.fn("Slack.messagePage")(function* (
+  channelId: string,
+  response: JsonObject,
+  token: string,
+) {
+  const raw = Array.isArray(response.messages) ? response.messages.map(asObject) : [];
+  const userNames = yield* authorNames(raw, token);
+  const nextCursor = stringValue(asObject(response.response_metadata), "next_cursor");
+  return {
+    channel_id: channelId,
+    messages: raw.map((message) => messageOutput(message, { channelId, userNames })),
+    has_more: response.has_more === true,
+    ...(nextCursor === undefined ? {} : { next_cursor: nextCursor }),
+  };
+});
+
+const readChannel = Effect.fn("Slack.readChannel")(function* (args: Args, token: string) {
+  const channel = yield* openDm(String(args.channel_id), token);
+  const response = yield* slackCall(
+    "conversations.history",
+    {
+      channel,
+      cursor: args.cursor,
+      latest: args.latest,
+      limit: Math.min(numberValue(args, "limit") ?? 100, 100),
+      oldest: args.oldest,
+    },
+    token,
+  );
+  return yield* messagePage(channel, response, token);
+});
+
+/** Accepts both `1790000000.123456` and a permalink's `p1790000000123456`. */
+const slackTs = (value: string): string => {
+  const digits = /^p(\d{7,})$/.exec(value)?.[1];
+  return digits === undefined ? value : `${digits.slice(0, -6)}.${digits.slice(-6)}`;
+};
+
+type ThreadTarget = { readonly channel: string; readonly ts: string };
+
+const permalinkTarget = (permalink: string | undefined): ThreadTarget | undefined => {
+  if (permalink === undefined || !URL.canParse(permalink)) return undefined;
+  const url = new URL(permalink);
+  const [, archives, channel, message] = url.pathname.split("/");
+  if (archives !== "archives" || !channel || !message?.startsWith("p")) return undefined;
+  return { channel, ts: url.searchParams.get("thread_ts") ?? slackTs(message) };
+};
+
+const readThread = Effect.fn("Slack.readThread")(function* (args: Args, token: string) {
+  const channelId = stringValue(args, "channel_id");
+  const messageTs = stringValue(args, "message_ts");
+  const target =
+    permalinkTarget(stringValue(args, "permalink")) ??
+    (channelId !== undefined && messageTs !== undefined
+      ? { channel: channelId, ts: slackTs(messageTs) }
+      : undefined);
+  if (target === undefined) {
+    return yield* new SlackApiError({
+      method: "conversations.replies",
+      code: "invalid_arguments",
+      detail: ["Pass channel_id with message_ts, or a message permalink."],
+    });
+  }
+  const channel = yield* openDm(target.channel, token);
+  const response = yield* slackCall(
+    "conversations.replies",
+    {
+      channel,
+      ts: target.ts,
+      cursor: args.cursor,
+      latest: args.latest,
+      limit: Math.min(numberValue(args, "limit") ?? 100, 1000),
+      oldest: args.oldest,
+    },
+    token,
+  );
+  const page = yield* messagePage(channel, response, token);
+  const parent = asObject(Array.isArray(response.messages) ? response.messages[0] : undefined);
+  return { ...page, thread_ts: stringValue(parent, "thread_ts") ?? target.ts };
+});
 
 const searchMessages = Effect.fn("Slack.searchMessages")(function* (
   args: Args,
@@ -425,8 +740,9 @@ const searchMessages = Effect.fn("Slack.searchMessages")(function* (
   }
 
   return {
-    results: matches.slice(0, limit),
-    paging: messages.paging ?? null,
+    messages: matches
+      .slice(0, limit)
+      .map((match) => messageOutput(match, { snippetChars: SEARCH_SNIPPET_CHARS })),
     total: typeof messages.total === "number" ? messages.total : matches.length,
   };
 });
@@ -794,37 +1110,14 @@ const invoke = Effect.fn("Slack.invokeTool")(function* (name: string, args: Args
     }
     case "slack_read_canvas":
       return yield* readFile(String(args.canvas_id), token);
-    case "slack_read_channel": {
-      const channel = yield* openDm(String(args.channel_id), token);
-      return yield* slackCall(
-        "conversations.history",
-        {
-          channel,
-          cursor: args.cursor,
-          latest: args.latest,
-          limit: Math.min(numberValue(args, "limit") ?? 100, 100),
-          oldest: args.oldest,
-        },
-        token,
-      );
-    }
+    case "slack_read_channel":
+      return yield* readChannel(args, token);
     case "slack_read_file":
       return yield* readFile(String(args.file_id), token);
     case "slack_read_list":
       return yield* readList(args, token);
     case "slack_read_thread":
-      return yield* slackCall(
-        "conversations.replies",
-        {
-          channel: args.channel_id,
-          ts: args.message_ts,
-          cursor: args.cursor,
-          latest: args.latest,
-          limit: Math.min(numberValue(args, "limit") ?? 100, 1000),
-          oldest: args.oldest,
-        },
-        token,
-      );
+      return yield* readThread(args, token);
     case "slack_read_user_profile":
       return yield* slackCall(
         "users.profile.get",

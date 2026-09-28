@@ -645,6 +645,35 @@ describe("exchangeAuthorizationCode", () => {
     ),
   );
 
+  it.effect("labels a Slack user grant with the authorizing user and workspace", () =>
+    Effect.gen(function* () {
+      const exchange = (body: Record<string, unknown>) =>
+        withTokenEndpoint(tokenResponse(body), ({ tokenUrl }) =>
+          exchangeAuthorizationCode({
+            tokenUrl,
+            clientId: "cid",
+            clientSecret: "csecret",
+            redirectUrl: "https://app.example.com/cb",
+            codeVerifier: "verifier",
+            code: "abc",
+          }),
+        );
+      const grant = {
+        access_token: "xoxp-user-token",
+        token_type: "Bearer",
+        scope: "",
+        authed_user: { id: "U12345", scope: "channels:read" },
+      };
+
+      const named = yield* exchange({ ...grant, team: { id: "T999", name: "Acme" } });
+      expect(named.idTokenIdentityLabel).toBe("U12345 @ Acme");
+      const unnamed = yield* exchange({ ...grant, team: { id: "T999" } });
+      expect(unnamed.idTokenIdentityLabel).toBe("U12345 @ T999");
+      const noTeam = yield* exchange(grant);
+      expect(noTeam.idTokenIdentityLabel).toBe("U12345");
+    }),
+  );
+
   it.effect("selects the nested user grant when an empty top-level grant has a bot token", () =>
     withTokenEndpoint(
       tokenResponse({

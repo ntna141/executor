@@ -1050,17 +1050,23 @@ type StrippedTokenResponse = {
 
 const NestedAuthedUserScope = Schema.Struct({
   authed_user: Schema.Struct({
+    id: Schema.optional(Schema.String),
     scope: Schema.String,
     access_token: Schema.optional(Schema.String),
     token_type: Schema.optional(Schema.String),
     refresh_token: Schema.optional(Schema.String),
     expires_in: Schema.optional(Schema.Number),
   }),
+  team: Schema.optional(
+    Schema.Struct({ id: Schema.optional(Schema.String), name: Schema.optional(Schema.String) }),
+  ),
 });
 const decodeNestedAuthedUserScope = Schema.decodeUnknownOption(NestedAuthedUserScope);
 
 type NestedAuthedUserGrant = {
   readonly scope: string;
+  /** The authorizing user and workspace, e.g. `U123 @ Acme`. */
+  readonly identityLabel?: string;
   readonly accessToken?: string;
   readonly tokenType?: string;
   readonly refreshToken?: string;
@@ -1086,8 +1092,12 @@ const nestedAuthedUserGrant = async (
   const nestedTokenType = decoded.value.authed_user.token_type;
   const nestedRefreshToken = decoded.value.authed_user.refresh_token;
   const nestedExpiresIn = decoded.value.authed_user.expires_in;
+  const userId = decoded.value.authed_user.id?.trim();
+  const workspace = decoded.value.team?.name?.trim() || decoded.value.team?.id?.trim();
+  const identityLabel = userId ? (workspace ? `${userId} @ ${workspace}` : userId) : undefined;
   return {
     scope: normalized,
+    ...(identityLabel === undefined ? {} : { identityLabel }),
     ...(nestedAccessToken === undefined ? {} : { accessToken: nestedAccessToken }),
     ...(nestedTokenType === undefined ? {} : { tokenType: nestedTokenType }),
     ...(nestedRefreshToken === undefined ? {} : { refreshToken: nestedRefreshToken }),
@@ -1140,9 +1150,10 @@ const processTokenEndpointResponse = async (
             scope: providerUserGrant.scope,
           }
       : parsed;
-  return stripped.idTokenIdentityLabel
-    ? { ...token, idTokenIdentityLabel: stripped.idTokenIdentityLabel }
-    : token;
+  // OIDC account claims win; Slack's user grant names only the user and
+  // workspace IDs, which still identify the account when no id_token is sent.
+  const identityLabel = stripped.idTokenIdentityLabel ?? providerUserGrant?.identityLabel;
+  return identityLabel ? { ...token, idTokenIdentityLabel: identityLabel } : token;
 };
 
 // ---------------------------------------------------------------------------
